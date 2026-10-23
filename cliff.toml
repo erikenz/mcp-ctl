@@ -24,6 +24,8 @@ filter_unconventional = false
 split_commits = false
 protect_breaking_commits = false
 commit_parsers = [
+  # The version bump is the release itself, not a change to report inside it.
+  { message = "^chore\\(release\\)", skip = true },
   { message = "^\\w+([(].*[)])?!:|BREAKING[ -]CHANGE", group = "<!--00-->⚠️ Breaking Changes" },
   { message = "^feat", group = "<!--01-->🚀 Features" },
   { message = "^fix", group = "<!--02-->🐛 Bug Fixes" },

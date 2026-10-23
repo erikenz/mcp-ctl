@@ -10,6 +10,9 @@ authors = ["erikenz"]
 description = "A unified manager, secret resolver, and runner for Model Context Protocol (MCP) servers"
 readme = "README.md"
 repository = "https://github.com/erikenz/mcp-ctl"
+# A binaries-only crate has nothing for docs.rs to render, so crates.io's
+# Documentation link points at the README instead of at an empty API page.
+documentation = "https://github.com/erikenz/mcp-ctl#readme"
 license = "MIT"
 # crates.io caps keywords at 20 characters, five of them. "model-context-protocol"
 # is 22 and would be rejected at publish time, which is a tag that cannot be reused.

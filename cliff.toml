@@ -1,0 +1,40 @@
+# Release notes for GitHub Releases, in the shape Payload uses: a version
+# heading with a compare link, then one section per commit type.
+#
+# The release workflow runs this against the tag being built. A pull request
+# title is the commit subject (squash merges keep the title), so the titles are
+# what decides the grouping: `feat(daemon): ...` lands under Features.
+
+[changelog]
+header = ""
+body = """{% if version %}## {% if previous.version %}[{{ version }}](https://github.com/erikenz/mcp-ctl/compare/{{ previous.version }}...{{ version }}){% else %}{{ version }}{% endif %} ({{ timestamp | date(format="%Y-%m-%d") }})
+{% endif %}{% for group, commits in commits | sort(attribute="group") | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+
+{% for commit in commits %}* {{ commit.message | split(pat="\n") | first | upper_first }}{% if commit.id %} ([{{ commit.id | truncate(length=7, end="") }}](https://github.com/erikenz/mcp-ctl/commit/{{ commit.id }})){% endif %}
+{% endfor %}{% endfor %}"""
+footer = ""
+trim = true
+
+[git]
+conventional_commits = true
+# A commit that does not follow the convention still ships in that release, so
+# it must still be listed. It lands under Other Changes instead of vanishing.
+filter_unconventional = false
+split_commits = false
+protect_breaking_commits = false
+commit_parsers = [
+  { message = "^\\w+([(].*[)])?!:|BREAKING[ -]CHANGE", group = "<!--00-->⚠️ Breaking Changes" },
+  { message = "^feat", group = "<!--01-->🚀 Features" },
+  { message = "^fix", group = "<!--02-->🐛 Bug Fixes" },
+  { message = "^perf", group = "<!--03-->⚡ Performance" },
+  { message = "^refactor", group = "<!--04-->🛠 Refactors" },
+  { message = "^docs", group = "<!--05-->📚 Documentation" },
+  { message = "^test", group = "<!--06-->🧪 Tests" },
+  { message = "^build", group = "<!--07-->📦 Build" },
+  { message = "^ci", group = "<!--08-->⚙️ CI" },
+  { message = "^style", group = "<!--09-->🎨 Styles" },
+  { message = "^revert", group = "<!--10-->⏪ Reverts" },
+  { message = "^chore", group = "<!--11-->🔧 Chores" },
+  { message = ".*", group = "<!--12-->🔀 Other Changes" },
+]

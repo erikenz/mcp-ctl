@@ -121,6 +121,20 @@ jobs:
           rpm -qip dist/mcp-ctl-0.0.0-1.x86_64.rpm
           rpm -qlp dist/mcp-ctl-0.0.0-1.x86_64.rpm | grep -qx '/usr/bin/mcp-ctl'
 
+      # The release workflow renders the Homebrew formula from the checksums it
+      # just attached; a broken template would otherwise surface at tag time, on
+      # a machine where the fix costs another release.
+      - name: Render the Homebrew formula
+        run: |
+          mkdir -p checksums
+          for target in aarch64-apple-darwin x86_64-apple-darwin \
+                        aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+            echo "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  mcp-ctl-0.0.0-${target}.tar.gz" \
+              > "checksums/mcp-ctl-0.0.0-${target}.tar.gz.sha256"
+          done
+          bash packaging/homebrew-formula.sh 0.0.0 checksums > mcp-ctl.rb
+          ruby -c mcp-ctl.rb
+
   msrv:
     name: Minimum supported Rust version
     runs-on: ubuntu-latest

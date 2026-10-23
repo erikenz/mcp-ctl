@@ -1,0 +1,31 @@
+# The pull request title becomes the commit subject on a squash merge, and the
+# release notes group commits by their conventional prefix. Checking it here is
+# what keeps `cliff.toml` producing the right sections.
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  title:
+    name: PR title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for a conventional commit title
+        shell: bash
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          pattern='^(feat|fix|perf|refactor|docs|test|build|ci|style|revert|chore)(\([^)]+\))?!?: .+'
+          if [[ "$TITLE" =~ $pattern ]]; then
+            echo "title ok: $TITLE"
+            exit 0
+          fi
+          echo "::error::'$TITLE' is not a conventional commit title"
+          echo "Use <type>(<scope>): <subject>, for example: feat(tray): restart one profile"
+          echo "Types: feat fix perf refactor docs test build ci style revert chore"
+          exit 1

@@ -196,20 +196,44 @@ jobs:
       contents: write
       actions: read
     steps:
+      # Full history and tags: the notes are the commits between the previous
+      # tag and this one, so a shallow checkout would produce an empty page.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: git-cliff
+
       # One job publishes the release. Five builds used to attach assets to it at the
       # same time, each regenerating the notes, so the body depended on finish order.
       - name: Download artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
 
+      - name: Generate release notes
+        shell: bash
+        run: |
+          git-cliff --config cliff.toml --tag "$GITHUB_REF_NAME" --unreleased --output notes.md
+          # git-cliff renders the empty header as a leading blank line.
+          sed -i '/./,$!d' notes.md
+          # A release with no commits since the last tag would publish an empty page.
+          if [ ! -s notes.md ]; then
+            printf '## %s\n' "$GITHUB_REF_NAME" > notes.md
+          fi
+          cat notes.md
+
       - name: Create GitHub release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          body_path: notes.md
 
   crates:
     name: Publish to crates.io
@@ -251,4 +275,68 @@ jobs:
             exit 0
           fi
           cargo publish --locked
+
+  homebrew:
+    name: Update the Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      # Same shape as the crates job: no token means the tap is not configured
+      # yet, which is a skip and not a failed release.
+      - name: Check for a tap token
+        id: token
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::notice::HOMEBREW_TAP_TOKEN is not set; skipping the Homebrew tap"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.token.outputs.skip != 'true'
+        with:
+          persist-credentials: false
+
+      # The checksums were attached to the release by build-release; the formula
+      # is rendered from exactly the files users download.
+      - name: Download checksums
+        if: steps.token.outputs.skip != 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Render and check the formula
+        if: steps.token.outputs.skip != 'true'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          bash packaging/homebrew-formula.sh "$version" dist > mcp-ctl.rb
+          ruby -c mcp-ctl.rb
+
+      - name: Push to the tap
+        if: steps.token.outputs.skip != 'true'
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          git clone --depth 1 \
+            "https://x-access-token:${TOKEN}@github.com/erikenz/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp mcp-ctl.rb tap/Formula/mcp-ctl.rb
+          cd tap
+          git config user.name "erikenz"
+          git config user.email "46247842+erikenz@users.noreply.github.com"
+          git add Formula/mcp-ctl.rb
+          if git diff --cached --quiet; then
+            echo "the formula already matches $version"
+            exit 0
+          fi
+          git commit -m "mcp-ctl $version"
+          git push
 

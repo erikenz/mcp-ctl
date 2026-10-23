@@ -27,6 +27,12 @@ Windows:
 irm https://raw.githubusercontent.com/erikenz/mcp-ctl/main/install/install.ps1 | iex
 ```
 
+Or with Homebrew on macOS or Linux:
+
+```bash
+brew install erikenz/tap/mcp-ctl
+```
+
 Or take the archive for your platform from the [latest release](https://github.com/erikenz/mcp-ctl/releases/latest), check it against the `.sha256` beside it, and put `mcp-ctl` somewhere on your `PATH`. The same release carries a `.deb` and a `.rpm` for Debian/Ubuntu and Fedora/RHEL.
 
 With Rust 1.88 or newer (edition 2024):

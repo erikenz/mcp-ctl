@@ -22,6 +22,18 @@ cargo test --all-features
 
 The integration tests start real daemons on ephemeral ports in their own temporary directories and stop them again. They never touch your real `~/.config` or the daemon you have running.
 
+## Pull request titles
+
+A squash merge makes the pull request title the commit subject, and the release notes are generated from those subjects by `cliff.toml`. Write titles as conventional commits:
+
+```text
+feat(tray): restart only the profile that was clicked
+fix: keep the control port out of the state file
+docs: say which platforms are beta
+```
+
+Types: `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `build`, `ci`, `style`, `revert`, `chore`. A `!` before the colon marks a breaking change, e.g. `feat(config)!: rename proxy_port`. The `PR title` check fails a pull request whose title does not match, because a release with an unclassified commit is a release with a missing line.
+
 ## Design notes
 
 A few rules keep the codebase coherent; please follow them:

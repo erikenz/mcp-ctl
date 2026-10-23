@@ -219,7 +219,11 @@ jobs:
       - name: Generate release notes
         shell: bash
         run: |
-          git-cliff --config cliff.toml --tag "$GITHUB_REF_NAME" --unreleased --output notes.md
+          # `--latest`, not `--unreleased`: the tag being built already exists in
+          # the checkout, so `--unreleased` sees no commits after it and renders an
+          # empty page. `--latest` renders the newest release section, which is the
+          # range between the previous tag and this one.
+          git-cliff --config cliff.toml --tag "$GITHUB_REF_NAME" --latest --output notes.md
           # git-cliff renders the empty header as a leading blank line.
           sed -i '/./,$!d' notes.md
           # A release with no commits since the last tag would publish an empty page.

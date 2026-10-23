@@ -1,0 +1,46 @@
+# Checks that the crate still packages cleanly. A broken package is otherwise
+# only discovered by `cargo publish` at tag time, and a tag cannot be reused.
+#
+# Not a required check: it costs a full rebuild in a fresh target directory, and
+# it only runs when crate-relevant files change.
+name: Package
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      # The package's two test-support binaries live in tests/support/.
+      - "tests/**"
+      - "README.md"
+      - "LICENSE"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: Package check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      - name: Cache Cargo Dependencies
+        uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+
+      - name: Package the crate
+        run: cargo package --locked

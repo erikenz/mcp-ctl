@@ -1,0 +1,78 @@
+[package]
+name = "mcp-ctl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+# No address here: crates.io prints this field, and the repository link is
+# already the place to find the author. Use a GitHub noreply address if one
+# is ever wanted instead.
+authors = ["erikenz"]
+description = "A unified manager, secret resolver, and runner for Model Context Protocol (MCP) servers"
+readme = "README.md"
+repository = "https://github.com/erikenz/mcp-ctl"
+license = "MIT"
+# crates.io caps keywords at 20 characters, five of them. "model-context-protocol"
+# is 22 and would be rejected at publish time, which is a tag that cannot be reused.
+keywords = ["mcp", "mcp-server", "mcp-proxy", "password-manager", "tailscale"]
+categories = ["command-line-utilities", "development-tools"]
+# Keep the crate tarball to the files a user of the crate needs. CI config,
+# editor settings, the installers and the packaging scripts belong to the
+# repository, not to `cargo package`.
+exclude = [
+    ".github/",
+    ".editorconfig",
+    ".delta/",
+    "data/",
+    "install/",
+    "packaging/",
+    "schema/",
+]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+# `termination` adds SIGTERM/SIGHUP to the SIGINT handler; `mcp-ctl stop` relies on it.
+ctrlc = { version = "3.5.2", features = ["termination"] }
+dirs = "6.0"
+flate2 = "1.1.10"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.1"
+tar = "0.4.46"
+tiny_http = "0.12.0"
+ureq = "3.5.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3.6", features = ["blocking"] }
+
+# macOS and Windows put the tray icon on the thread that owns the application event loop,
+# so those platforms need a real event loop (and no ksni). Linux keeps ksni, which is pure
+# Rust and needs no GTK or libappindicator on the build machine.
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+# `default-features = false` drops the libappindicator (GTK3) backend: it is the Linux
+# backend, and Linux uses ksni instead. Leaving it on resolves GTK, glib and pango into
+# Cargo.lock for a target that never builds, which is a dependency alert nobody can act
+# on. muda is still there, using the native menu on each of these two platforms.
+tray-icon = { version = "0.26", default-features = false }
+winit = "0.30"
+
+[features]
+# Builds the fake MCP server and fake auth proxy the integration tests drive.
+# Run the full suite with: cargo test --all-features
+# They are never built (or installed) without this feature.
+test-support = []
+
+[[bin]]
+name = "mcp-fake-server"
+path = "tests/support/fake_server.rs"
+required-features = ["test-support"]
+
+[[bin]]
+name = "mcp-fake-auth-proxy"
+path = "tests/support/fake_auth_proxy.rs"
+required-features = ["test-support"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

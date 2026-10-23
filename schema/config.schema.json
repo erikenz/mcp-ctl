@@ -1,0 +1,298 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/erikenz/mcp-ctl/main/schema/config.schema.json",
+  "title": "mcp-ctl profile",
+  "description": "One mcp-ctl profile: its settings and the MCP servers it manages. Unknown keys are rejected at this level, so a typo such as `proxy_portt` is reported; keys mcp-ctl does not know are ignored inside a server entry, because those entries are the shape every MCP client uses.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "mcpServers": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/server"
+      },
+      "description": "The MCP servers this profile manages."
+    },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bind": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Address the hub binds to. It has no authentication of its own, so keep it loopback unless you know why."
+        },
+        "listen_port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 37373,
+          "description": "0 asks the operating system for a free port."
+        },
+        "proxy_port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 8080
+        },
+        "external_url": {
+          "type": "string",
+          "description": "Public URL clients use, for example https://device.example.ts.net. Required once authentication is enabled."
+        },
+        "auth_proxy_path": {
+          "type": "string",
+          "description": "Where mcp-auth-proxy lives, if it is not on PATH."
+        },
+        "tool_timeout_secs": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 300,
+          "description": "How long one backend tool call may take. 0 waits forever."
+        },
+        "allowed_origins": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Extra browser origins allowed to call the hub, for example https://inspector.example:6274."
+        }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "password": {
+          "$ref": "#/$defs/secret"
+        },
+        "github_client_id": {
+          "$ref": "#/$defs/secret"
+        },
+        "github_client_secret": {
+          "$ref": "#/$defs/secret"
+        },
+        "google_client_id": {
+          "$ref": "#/$defs/secret"
+        },
+        "google_client_secret": {
+          "$ref": "#/$defs/secret"
+        },
+        "bearer_token": {
+          "$ref": "#/$defs/secret",
+          "description": "Static Authorization: Bearer token checked by the hub. Cannot be combined with password or the OAuth settings."
+        }
+      }
+    },
+    "tunnel": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "enum": [
+            "none",
+            "tailscale",
+            "cloudflared"
+          ],
+          "default": "none"
+        },
+        "auto_start": {
+          "type": "boolean",
+          "default": true
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        }
+      }
+    },
+    "tray": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show a system tray icon while mcp-ctl up is running (Linux)."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "secret": {
+      "description": "A plain value for a setting that is not secret, or where mcp-ctl should fetch a secret from. Secret values are never written to disk or logged.",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "required": [
+            "source"
+          ],
+          "oneOf": [
+            {
+              "type": "object",
+              "required": [
+                "source"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "source": {
+                  "const": "env"
+                },
+                "name": {
+                  "type": "string"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "source",
+                "run"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "source": {
+                  "const": "command"
+                },
+                "run": {
+                  "type": "string"
+                },
+                "args": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "source",
+                "item"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "source": {
+                  "const": "bitwarden"
+                },
+                "item": {
+                  "type": "string"
+                },
+                "field": {
+                  "type": "string"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "source",
+                "reference"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "source": {
+                  "const": "1password"
+                },
+                "reference": {
+                  "type": "string"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "server": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "Program to run for a local stdio server."
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/secret"
+          },
+          "description": "Environment for the server, keyed by variable name. Values may name where to fetch them."
+        },
+        "url": {
+          "type": "string",
+          "description": "For a remote MCP server. mcp-ctl lists these but cannot serve them yet."
+        },
+        "serve": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether `mcp-ctl up` serves this server."
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "prefix": {
+          "type": "string",
+          "description": "Prefix for this server's tool names, e.g. github_create_issue."
+        },
+        "timeout_secs": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Overrides server.tool_timeout_secs. 0 waits forever."
+        },
+        "env_clear": {
+          "type": "boolean",
+          "default": false,
+          "description": "Start with an empty environment instead of inheriting mcp-ctl's."
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Working directory to start the server in. Relative paths resolve against mcp-ctl's working directory."
+        },
+        "tools": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Which of this server's tools to publish. A pattern is a tool name or a prefix ending in `*`.",
+          "properties": {
+            "include": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "exclude": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "command"
+          ]
+        },
+        {
+          "required": [
+            "url"
+          ]
+        }
+      ]
+    }
+  }
+}

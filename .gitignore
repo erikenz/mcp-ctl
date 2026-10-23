@@ -1,0 +1,9 @@
+/target
+/data
+/.delta
+**/*.rs.bk
+*.swp
+*.swo
+.DS_Store
+*.tmp
+.env

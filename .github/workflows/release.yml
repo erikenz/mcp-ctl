@@ -1,0 +1,254 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify before publishing
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache Cargo Dependencies
+        uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+
+      # Every archive is named after the version it contains, so a tag that does not
+      # match Cargo.toml must stop here rather than produce misleading file names.
+      - name: Check the tag matches the crate version
+        id: version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$version" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the Cargo.toml version $crate"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features --locked
+
+  build-release:
+    name: Build (${{ matrix.target }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    # `attestations` and `id-token` are what let the job sign build provenance for
+    # the binary it just produced.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl, so one binary runs on any distribution whatever its glibc. The
+          # archives are named after the target triple, which is what install scripts,
+          # `cargo binstall` and every other Rust CLI release use.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary_name: mcp-ctl
+            archive: tar.gz
+          # Arm64 runners are free for public repositories, so the release path
+          # needs no `cross` container and no unpinned tool installed from git.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            binary_name: mcp-ctl
+            archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary_name: mcp-ctl
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary_name: mcp-ctl
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: mcp-ctl.exe
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # The musl targets carry their own libc and link static on their own; a
+      # musl-gcc linker override would produce a dynamically linked binary instead.
+      - name: Build
+        env:
+          # Nobody installing one of these needs debug symbols, and one codegen
+          # unit trades build time we do not need for a faster binary.
+          RUSTFLAGS: -C strip=symbols -C codegen-units=1
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Name the archive
+        id: asset
+        shell: bash
+        run: echo "name=mcp-ctl-${{ env.VERSION }}-${{ matrix.target }}.${{ matrix.archive }}" >> "$GITHUB_OUTPUT"
+
+      - name: Package Binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czvf ../../../${{ steps.asset.outputs.name }} ${{ matrix.binary_name }}
+          cd ../../..
+
+      - name: Package Binary (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../${{ steps.asset.outputs.name }} ${{ matrix.binary_name }}
+          cd ../../..
+
+      # After packaging on every platform: the archive has to exist before it can be hashed.
+      - name: Checksum
+        shell: bash
+        run: |
+          name="${{ steps.asset.outputs.name }}"
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$name" > "$name.sha256"
+          else
+            shasum -a 256 "$name" > "$name.sha256"
+          fi
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.asset.outputs.name }}
+
+      # Debian and Fedora users get a native package; the binary is static, so
+      # neither package has a dependency to declare.
+      - name: Build Linux packages
+        if: contains(matrix.target, 'linux')
+        shell: bash
+        run: |
+          sudo apt-get update && sudo apt-get install -y rpm
+          case "${{ matrix.target }}" in
+            x86_64-*) deb_arch=amd64; rpm_arch=x86_64 ;;
+            aarch64-*) deb_arch=arm64; rpm_arch=aarch64 ;;
+          esac
+          bash packaging/build-packages.sh "$VERSION" "$deb_arch" "$rpm_arch" \
+            "target/${{ matrix.target }}/release/mcp-ctl" dist
+
+      - name: Attest Linux packages
+        if: contains(matrix.target, 'linux')
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*
+
+      - name: Upload Linux packages
+        if: contains(matrix.target, 'linux')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: packages-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.asset.outputs.name }}
+          path: |
+            ${{ steps.asset.outputs.name }}
+            ${{ steps.asset.outputs.name }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build-release
+    runs-on: ubuntu-latest
+    # `actions: read` is what lets this job collect the artifacts of its own run;
+    # `contents: write` is what lets it create the release.
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      # One job publishes the release. Five builds used to attach assets to it at the
+      # same time, each regenerating the notes, so the body depended on finish order.
+      - name: Download artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+  crates:
+    name: Publish to crates.io
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # A missing token is a normal state before the first crates.io publish, so
+      # it skips instead of failing the release.
+      - name: Check for a crates.io token
+        id: token
+        env:
+          TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::notice::CARGO_REGISTRY_TOKEN is not set; skipping crates.io"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        if: steps.token.outputs.skip != 'true'
+
+      - name: Install Rust
+        if: steps.token.outputs.skip != 'true'
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      - name: Publish
+        if: steps.token.outputs.skip != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if curl -fsS -H 'User-Agent: mcp-ctl-release' \
+              "https://crates.io/api/v1/crates/mcp-ctl/$version" > /dev/null; then
+            echo "mcp-ctl $version is already on crates.io; nothing to do"
+            exit 0
+          fi
+          cargo publish --locked
+

@@ -206,7 +206,7 @@ jobs:
       - name: Install git-cliff
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
-          tool: git-cliff
+          tool: git-cliff@2.14.2
 
       # One job publishes the release. Five builds used to attach assets to it at the
       # same time, each regenerating the notes, so the body depended on finish order.

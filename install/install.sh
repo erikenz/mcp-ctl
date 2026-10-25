@@ -68,6 +68,11 @@ if [ -z "$VERSION" ]; then
   esac
 fi
 
+# The version becomes part of a URL and a file path. Releases are x.y.z, so reject
+# anything else instead of building a surprising path from a tag.
+printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+  || die "invalid version '$VERSION': expected a release version such as 1.2.3"
+
 archive="mcp-ctl-${VERSION}-${target}.tar.gz"
 url="${BASE_URL}/v${VERSION}/${archive}"
 

@@ -87,8 +87,27 @@ impl Sandbox {
     }
 
     /// Write the `.env` next to the profile files, where `{"source": "env"}` looks.
+    ///
+    /// Owner-only from creation, like `mcp-ctl init`: `load_env_file` refuses a file
+    /// that other local users can read.
     pub fn env_file(&self, contents: &str) {
-        std::fs::write(self.config_dir.join(".env"), contents).expect("write .env");
+        let path = self.config_dir.join(".env");
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .expect("write .env");
+            file.write_all(contents.as_bytes()).expect("write .env");
+        }
+        #[cfg(not(unix))]
+        std::fs::write(&path, contents).expect("write .env");
     }
 
     /// Merge a fragment into `config.json`, so a test can write the catalogue and the settings

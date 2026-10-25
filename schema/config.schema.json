@@ -23,7 +23,7 @@
         "bind": {
           "type": "string",
           "default": "127.0.0.1",
-          "description": "Address the hub binds to. It has no authentication of its own, so keep it loopback unless you know why."
+          "description": "Address the hub binds to. It has no authentication of its own; only auth.bearer_token protects this port. A non-loopback bind with proxy-only auth is refused."
         },
         "listen_port": {
           "type": "integer",
@@ -36,11 +36,12 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 65535,
-          "default": 8080
+          "default": 8080,
+          "description": "Port the auth proxy listens on. 0 is not supported: the tunnel target and status need the real port."
         },
         "external_url": {
           "type": "string",
-          "description": "Public URL clients use, for example https://device.example.ts.net. Required once authentication is enabled."
+          "description": "Public URL clients use, for example https://device.example.ts.net. Required once authentication is enabled. Must be https:// unless it is a loopback URL for local testing."
         },
         "auth_proxy_path": {
           "type": "string",
@@ -82,7 +83,7 @@
         },
         "bearer_token": {
           "$ref": "#/$defs/secret",
-          "description": "Static Authorization: Bearer token checked by the hub. Cannot be combined with password or the OAuth settings."
+          "description": "Static Authorization: Bearer token checked by the hub. Use at least 16 characters of random data. Cannot be combined with password or the OAuth settings."
         }
       }
     },
@@ -105,7 +106,8 @@
         "port": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 65535
+          "maximum": 65535,
+          "description": "Local port the tunnel forwards to. Defaults to the auth proxy's port, or the hub's. With proxy auth it must be the proxy port; a tunnel aimed at the unauthenticated hub is refused."
         }
       }
     },
@@ -228,7 +230,7 @@
           "additionalProperties": {
             "$ref": "#/$defs/secret"
           },
-          "description": "Environment for the server, keyed by variable name. Values may name where to fetch them."
+          "description": "Environment for the server, keyed by variable name. A plain string is for a value that is not secret; use a source for a credential (check warns when the name looks like one)."
         },
         "url": {
           "type": "string",

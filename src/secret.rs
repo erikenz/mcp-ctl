@@ -22,6 +22,28 @@ static ENV_FILE: OnceLock<(PathBuf, HashMap<String, String>)> = OnceLock::new();
 
 /// Read the `.env` next to the profile files, if it exists. Returns how many values it holds.
 pub fn load_env_file(path: &Path) -> Result<usize> {
+    // `.env` is a secret store. `init` creates it 0600, but a file made by hand or
+    // restored from a backup may be world-readable; refuse that rather than leak the
+    // auth password or bearer token to another local user.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(metadata) => {
+                let mode = metadata.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    bail!(
+                        "{} is readable by other users (mode {mode:o}); secrets belong in an \
+                         owner-only file. Run `chmod 600 {}` and try again.",
+                        path.display(),
+                        path.display()
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(anyhow!("failed to read {}: {error}", path.display())),
+        }
+    }
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -126,9 +148,9 @@ pub fn describe(value: &SecretValue) -> String {
         SecretValue::Source(SecretSource::OnePassword { reference }) => {
             format!("1Password reference '{reference}'")
         }
-        SecretValue::Source(SecretSource::Command { run, args }) => {
-            format!("command `{run} {}`", args.join(" "))
-        }
+        // Do not print the arguments: a command source may carry a token in an argument,
+        // and this description ends up in `check` output and error messages.
+        SecretValue::Source(SecretSource::Command { run, .. }) => format!("command `{run}`"),
     }
 }
 
@@ -212,11 +234,8 @@ fn cmd_get(run: &str, args: &[String]) -> Result<String> {
     })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        bail!(
-            "command `{run} {}` failed with {}: {stderr}",
-            args.join(" "),
-            output.status
-        );
+        // Only the program name: the arguments may contain the secret itself.
+        bail!("command `{run}` failed with {}: {stderr}", output.status);
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -260,6 +279,39 @@ mod tests {
         });
         let error = resolve("KEY", &value).unwrap_err().to_string();
         assert!(error.contains("MCP_CTL_TEST_MISSING_VARIABLE"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_world_readable_env_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "mcp-ctl-env-permissions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "TOKEN=secret\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = load_env_file(&path).unwrap_err().to_string();
+        assert!(error.contains("chmod 600"), "{error}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn command_descriptions_do_not_print_their_arguments() {
+        let value = SecretValue::Source(SecretSource::Command {
+            run: "vault-read".to_string(),
+            args: vec!["--token".to_string(), "super-secret".to_string()],
+        });
+        let description = describe(&value);
+        assert_eq!(description, "command `vault-read`");
+        assert!(!description.contains("super-secret"), "{description}");
     }
 
     #[cfg(unix)]

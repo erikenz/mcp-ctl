@@ -29,7 +29,7 @@ use crate::orchestrator::UpOptions;
 #[derive(Parser)]
 #[command(name = "mcp-ctl", version, about)]
 struct Cli {
-    /// Log every request: method, URL and headers (credentials are redacted)
+    /// Log every request: method, path and headers (credentials are redacted)
     #[arg(long, short, global = true)]
     verbose: bool,
 

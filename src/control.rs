@@ -15,15 +15,15 @@
 //! The state file is the only thing mcp-ctl writes that contains a secret (the
 //! token), which is why it is created owner-only on Unix.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -34,6 +34,16 @@ use std::path::Path;
 
 /// How long a control connection may take, in either direction.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A control request is one small JSON line; a longer one is not a client we serve.
+const MAX_CONTROL_LINE: usize = 8 * 1024;
+
+/// A status reply grows with the number of servers, so it gets a larger cap than a request.
+const MAX_CONTROL_REPLY: usize = 1024 * 1024;
+
+/// Concurrent control connections. The listener is loopback-only, but a local process must
+/// not be able to exhaust the daemon's threads before it even presents a token.
+const MAX_CONTROL_CONNECTIONS: usize = 32;
 
 /// What the daemon records about itself, and what `status` reads back.
 #[derive(Clone, Serialize, Deserialize)]
@@ -206,7 +216,7 @@ impl ControlServer {
         Ok(Self {
             listener,
             port,
-            token: random_token(),
+            token: random_token()?,
         })
     }
 
@@ -226,6 +236,7 @@ impl ControlServer {
     /// says nothing holds only its own thread for the read timeout instead of delaying
     /// `status` or `stop` behind it.
     pub fn serve(self, info: Arc<ControlInfo>, hub: Arc<Hub>, stop: Sender<()>) {
+        let in_flight = Arc::new(AtomicUsize::new(0));
         loop {
             let stream = match self.listener.accept() {
                 Ok((stream, _)) => stream,
@@ -236,14 +247,18 @@ impl ControlServer {
                     continue;
                 }
             };
+            if in_flight.fetch_add(1, Ordering::SeqCst) >= MAX_CONTROL_CONNECTIONS {
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                continue;
+            }
             let token = self.token.clone();
             let info = Arc::clone(&info);
             let hub = Arc::clone(&hub);
             let stop = stop.clone();
-            // shortcut: one uncapped thread per control connection. The listener is
-            // loopback-only and token-guarded, so a flood means a local attacker who could
-            // already do worse; add a counter like the HTTP server's if that changes.
+            let guard = ControlGuard(Arc::clone(&in_flight));
             std::thread::spawn(move || {
+                let _guard = guard;
                 let _ = stream.set_read_timeout(Some(CONTROL_TIMEOUT));
                 let _ = stream.set_write_timeout(Some(CONTROL_TIMEOUT));
                 if let Err(error) = answer(&stream, &token, &info, &hub, &stop) {
@@ -251,6 +266,15 @@ impl ControlServer {
                 }
             });
         }
+    }
+}
+
+/// Decrements the control connection counter however the thread ends.
+struct ControlGuard(Arc<AtomicUsize>);
+
+impl Drop for ControlGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -263,8 +287,12 @@ fn answer(
 ) -> Result<()> {
     let mut line = String::new();
     BufReader::new(stream)
+        .take(MAX_CONTROL_LINE as u64)
         .read_line(&mut line)
         .context("failed to read the control request")?;
+    if line.len() >= MAX_CONTROL_LINE && !line.ends_with('\n') {
+        bail!("control request is too long");
+    }
 
     let message: Message =
         serde_json::from_str(line.trim()).context("malformed control request")?;
@@ -338,8 +366,12 @@ fn request(state: &StateFile, command: &str) -> Result<Reply> {
 
     let mut line = String::new();
     BufReader::new(&stream)
+        .take(MAX_CONTROL_REPLY as u64)
         .read_line(&mut line)
         .context("failed to read the control reply")?;
+    if line.len() >= MAX_CONTROL_REPLY && !line.ends_with('\n') {
+        bail!("the daemon sent an overlong control reply");
+    }
     let reply: Reply =
         serde_json::from_str(line.trim()).context("the daemon sent an unexpected reply")?;
     if !reply.ok {
@@ -518,27 +550,13 @@ pub fn now_secs() -> u64 {
 
 /// A token other local users cannot guess.
 ///
-/// `RandomState` is seeded from the operating system's randomness, so it is enough
-/// here without adding an RNG dependency.
-fn random_token() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u32(std::process::id());
-    hasher.write_u128(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or_default(),
-    );
-    let first = hasher.finish();
-
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u64(first);
-    let second = hasher.finish();
-
-    format!("{first:016x}{second:016x}")
+/// This is a security token, so it comes from the operating system's CSPRNG rather than
+/// from a hash seed whose algorithm is an implementation detail.
+fn random_token() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| anyhow!("failed to read OS randomness for the control token: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// Compare two tokens without leaking their length or contents through timing.
@@ -744,8 +762,33 @@ mod tests {
 
     #[test]
     fn generated_tokens_differ() {
-        assert_ne!(random_token(), random_token());
-        assert_eq!(random_token().len(), 32);
+        assert_ne!(random_token().unwrap(), random_token().unwrap());
+        assert_eq!(random_token().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn an_overlong_control_request_is_refused() {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut client = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        client.write_all(&vec![b'x'; MAX_CONTROL_LINE + 1]).unwrap();
+
+        let info = ControlInfo {
+            pid: 4242,
+            version: "test".to_string(),
+            started_at: now_secs(),
+            hub_port: 37373,
+            proxy_port: None,
+            external_url: Arc::new(Mutex::new(None)),
+            auth_methods: Vec::new(),
+            log_file: PathBuf::from("test.log"),
+            ready: Arc::new(AtomicBool::new(true)),
+        };
+        let hub = Hub::new();
+        let (stop, _stop_rx) = std::sync::mpsc::channel();
+        let error = answer(&server, "token", &info, &hub, &stop).unwrap_err();
+        assert!(error.to_string().contains("too long"), "{error}");
     }
 
     #[cfg(unix)]

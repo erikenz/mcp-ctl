@@ -47,6 +47,8 @@ pub struct Decision {
     pub use_auth: bool,
     /// The tunnel will be started.
     pub use_tunnel: bool,
+    /// The local port the tunnel will forward to, when it will start.
+    pub tunnel_target: Option<u16>,
     /// Why `up` refuses to start, in the order it would report them.
     pub refusals: Vec<String>,
     /// What `up` warns about without refusing.
@@ -75,6 +77,14 @@ pub fn decide(config: &ToolConfig, request: &Request) -> Decision {
     let use_auth = use_proxy || use_bearer;
     let use_tunnel =
         !request.no_tunnel && tunnel.auto_start && tunnel.provider != TunnelProvider::None;
+    // The proxy is a separate port. It authenticates the tunnel in front of it, not the
+    // hub itself: the hub stays unauthenticated unless a bearer token guards it.
+    let hub_authenticated = use_bearer;
+    let tunnel_target = use_tunnel.then(|| {
+        tunnel
+            .port
+            .unwrap_or(if use_proxy { proxy_port } else { hub_port })
+    });
 
     let mut refusals = Vec::new();
     let mut notes = Vec::new();
@@ -82,6 +92,15 @@ pub fn decide(config: &ToolConfig, request: &Request) -> Decision {
 
     if request.no_auth && auth.is_enabled() {
         notes.push("warning: authentication is configured but disabled by --no-auth".to_string());
+    }
+
+    if use_proxy && proxy_port == 0 {
+        refusals.push(
+            "server.proxy_port must not be 0: the auth proxy's real port is needed for the \
+             tunnel target and for `status`, and mcp-ctl cannot discover a port the proxy \
+             chooses itself.\nSet server.proxy_port (or pass --proxy-port) to a fixed port."
+                .to_string(),
+        );
     }
 
     if use_proxy && external_url.is_none() {
@@ -94,26 +113,62 @@ pub fn decide(config: &ToolConfig, request: &Request) -> Decision {
         ));
     }
 
+    // A public URL must be HTTPS unless it is loopback. The CLI override is validated
+    // here too, because `ToolConfig::validate` only sees the profile file.
+    if let Some(url) = &external_url
+        && let Err(error) = crate::config::validate_external_url(url)
+    {
+        refusals.push(format!(
+            "{error}\nSet server.external_url in {config_file} (or pass --external-url) to an \
+             HTTPS URL, or use a loopback HTTP URL for local testing."
+        ));
+    }
+
     // One rule for exposure: an unauthenticated hub gives anything that can reach it every
-    // tool of every served server, so that needs an explicit opt-in. A bearer token
-    // authenticates the hub itself and lifts the rule.
-    if !use_auth && !request.allow_unauthenticated_exposure {
-        if !bind.is_loopback() {
+    // tool of every served server, so that needs an explicit opt-in. Only a bearer token
+    // authenticates the hub itself; the proxy is a separate loopback port and does not
+    // protect the hub port.
+    if !request.allow_unauthenticated_exposure {
+        if !hub_authenticated && !bind.is_loopback() {
+            let reachable = if hub_port == 0 {
+                format!("the hub port on {bind}")
+            } else {
+                format!("{bind}:{hub_port}")
+            };
             refusals.push(format!(
                 "refusing to bind the unauthenticated hub to {bind}.\n\
-                 Anything that can reach this machine could call every tool of every served server.\n\
-                 Configure auth.bearer_token or auth.password in {config_file}, keep the loopback \
-                 default, or pass --allow-unauthenticated-exposure if that is really what you want."
+                 The auth proxy protects only its own loopback port; the hub itself has no \
+                 authentication, so anything that can reach {reachable} can call every \
+                 tool of every served server.\n\
+                 Configure auth.bearer_token in {config_file}, keep the loopback default, or pass \
+                 --allow-unauthenticated-exposure if that is really what you want."
             ));
         }
-        if use_tunnel {
-            refusals.push(format!(
-                "refusing to publish an unauthenticated hub.\n\
-                 The tunnel would expose every tool of every served server to the internet with no \
-                 authentication at all.\n\
-                 Configure auth.bearer_token or auth.password in {config_file}, run with --no-tunnel \
-                 to stay local, or pass --allow-unauthenticated-exposure if that is really what you want."
-            ));
+
+        if use_tunnel && !hub_authenticated {
+            let target = tunnel_target.unwrap_or(hub_port);
+            if !(use_proxy && target == proxy_port) {
+                let detail = if use_proxy {
+                    format!(
+                        "The tunnel would forward to port {target}, which is not the authenticated \
+                         proxy port {proxy_port}; the hub itself has no authentication, so the \
+                         tunnel would expose every tool of every served server.\n\
+                         Leave tunnel.port unset (or set it to {proxy_port}) so the tunnel reaches \
+                         the proxy."
+                    )
+                } else {
+                    format!(
+                        "The tunnel would forward to port {target}, and the hub itself has no \
+                         authentication, so it would expose every tool of every served server.\n\
+                         Configure auth.bearer_token, run with --no-tunnel to stay local, or set \
+                         tunnel.port to an authenticated endpoint."
+                    )
+                };
+                refusals.push(format!(
+                    "refusing to publish an unauthenticated hub through a tunnel.\n{detail}\n\
+                     Pass --allow-unauthenticated-exposure if that is really what you want."
+                ));
+            }
         }
     }
 
@@ -126,6 +181,7 @@ pub fn decide(config: &ToolConfig, request: &Request) -> Decision {
         use_bearer,
         use_auth,
         use_tunnel,
+        tunnel_target,
         refusals,
         notes,
     }
@@ -283,6 +339,164 @@ mod tests {
         assert_eq!(
             decision.external_url.as_deref(),
             Some("https://laptop.example.ts.net")
+        );
+    }
+
+    #[test]
+    fn a_proxy_does_not_authenticate_a_non_loopback_bind() {
+        // The proxy listens on loopback; the hub itself stays unauthenticated. Binding the
+        // hub to a LAN address must therefore be refused just as if no proxy were running.
+        let decision = decide(
+            &config(
+                r#"{
+                    "server": {"bind": "0.0.0.0", "external_url": "https://laptop.example.ts.net"},
+                    "auth": {"password": {"source": "env", "name": "MCP_CTL_AUTH_PASSWORD"}}
+                }"#,
+            ),
+            &request(),
+        );
+        assert!(decision.use_proxy);
+        assert!(
+            decision
+                .refusals
+                .iter()
+                .any(|refusal| refusal.contains("refusing to bind")
+                    && refusal.contains("proxy protects only")),
+            "{:?}",
+            decision.refusals
+        );
+    }
+
+    #[test]
+    fn a_tunnel_pointed_at_the_hub_bypasses_proxy_auth() {
+        let decision = decide(
+            &config(
+                r#"{
+                    "server": {
+                        "listen_port": 37373,
+                        "proxy_port": 8080,
+                        "external_url": "https://laptop.example.ts.net"
+                    },
+                    "tunnel": {"provider": "cloudflared", "port": 37373},
+                    "auth": {"password": {"source": "env", "name": "MCP_CTL_AUTH_PASSWORD"}}
+                }"#,
+            ),
+            &request(),
+        );
+        assert_eq!(decision.tunnel_target, Some(37373));
+        assert!(
+            decision
+                .refusals
+                .iter()
+                .any(|refusal| refusal.contains("refusing to publish")),
+            "{:?}",
+            decision.refusals
+        );
+    }
+
+    #[test]
+    fn a_tunnel_pointed_at_the_proxy_is_allowed() {
+        let decision = decide(
+            &config(
+                r#"{
+                    "server": {
+                        "listen_port": 37373,
+                        "proxy_port": 8080,
+                        "external_url": "https://laptop.example.ts.net"
+                    },
+                    "tunnel": {"provider": "cloudflared", "port": 8080},
+                    "auth": {"password": {"source": "env", "name": "MCP_CTL_AUTH_PASSWORD"}}
+                }"#,
+            ),
+            &request(),
+        );
+        assert!(decision.refusals.is_empty(), "{:?}", decision.refusals);
+        assert_eq!(decision.tunnel_target, Some(8080));
+    }
+
+    #[test]
+    fn a_bearer_token_allows_a_tunnel_to_the_hub() {
+        let decision = decide(
+            &config(
+                r#"{
+                    "server": {"listen_port": 37373},
+                    "tunnel": {"provider": "cloudflared", "port": 37373},
+                    "auth": {"bearer_token": {"source": "env", "name": "MCP_CTL_TOKEN"}}
+                }"#,
+            ),
+            &request(),
+        );
+        assert!(decision.refusals.is_empty(), "{:?}", decision.refusals);
+        assert_eq!(decision.tunnel_target, Some(37373));
+    }
+
+    #[test]
+    fn a_zero_proxy_port_is_refused() {
+        let decision = decide(
+            &config(
+                r#"{
+                    "server": {"external_url": "https://laptop.example.ts.net"},
+                    "auth": {"password": {"source": "env", "name": "MCP_CTL_AUTH_PASSWORD"}}
+                }"#,
+            ),
+            &Request {
+                proxy_port: Some(0),
+                ..request()
+            },
+        );
+        assert!(
+            decision
+                .refusals
+                .iter()
+                .any(|refusal| refusal.contains("proxy_port")),
+            "{:?}",
+            decision.refusals
+        );
+    }
+
+    #[test]
+    fn a_public_http_external_url_is_refused() {
+        let decision = decide(
+            &config(
+                r#"{
+                    "server": {"external_url": "https://laptop.example.ts.net"},
+                    "auth": {"password": {"source": "env", "name": "MCP_CTL_AUTH_PASSWORD"}}
+                }"#,
+            ),
+            &Request {
+                external_url: Some("http://laptop.example.ts.net".to_string()),
+                ..request()
+            },
+        );
+        assert!(
+            decision
+                .refusals
+                .iter()
+                .any(|refusal| refusal.contains("https://")),
+            "{:?}",
+            decision.refusals
+        );
+    }
+
+    #[test]
+    fn a_loopback_http_external_url_is_allowed_for_local_testing() {
+        let decision = decide(
+            &config(
+                r#"{
+                    "server": {"external_url": "https://laptop.example.ts.net"},
+                    "auth": {"password": {"source": "env", "name": "MCP_CTL_AUTH_PASSWORD"}}
+                }"#,
+            ),
+            &Request {
+                external_url: Some("http://127.0.0.1:8080".to_string()),
+                ..request()
+            },
+        );
+        assert!(
+            !decision
+                .refusals
+                .iter()
+                .any(|refusal| refusal.contains("https://"))
         );
     }
 

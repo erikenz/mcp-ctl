@@ -20,6 +20,7 @@ pub fn run(paths: &Paths, tool_config: &ToolConfig, as_json: bool) -> Result<usi
     let tunnel_config = tool_config.tunnel();
 
     let mut problems: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
     let mut reports: Vec<Value> = Vec::new();
     // Programs the configuration implies we will need.
     let mut needed: BTreeSet<String> = BTreeSet::new();
@@ -57,6 +58,22 @@ pub fn run(paths: &Paths, tool_config: &ToolConfig, as_json: bool) -> Result<usi
             for (key, value) in &server.env {
                 let source = secret::describe(value);
                 record_program(value, &mut needed);
+
+                // A backend inherits the daemon's environment unless it is isolated. A
+                // variable exported in this shell therefore reaches the server even when the
+                // profile does not name it, and a literal env value is a secret in the file.
+                if !server.env_clear && std::env::var_os(key).is_some() {
+                    notes.push(format!(
+                        "{name}: {key} is exported in this shell, so the backend inherits it; \
+                         use env_clear or .env if that is not intended"
+                    ));
+                }
+                if matches!(value, SecretValue::Literal(_)) && looks_like_secret(key) {
+                    notes.push(format!(
+                        "{name}: {key} looks like a secret but is a literal in the profile file; \
+                         use .env or a vault source"
+                    ));
+                }
 
                 match secret::resolve(key, value) {
                     // The value itself is deliberately never printed, only where it came from.
@@ -97,7 +114,7 @@ pub fn run(paths: &Paths, tool_config: &ToolConfig, as_json: bool) -> Result<usi
         },
     );
     problems.extend(decision.refusals.iter().cloned());
-    let notes: Vec<String> = decision.notes.clone();
+    notes.extend(decision.notes.clone());
 
     // Authentication secrets are only needed when authentication is enabled, but a bad
     // reference should surface here rather than in the middle of a sign-in flow.
@@ -106,8 +123,15 @@ pub fn run(paths: &Paths, tool_config: &ToolConfig, as_json: bool) -> Result<usi
     if decision.use_auth {
         for (key, value) in auth_secrets(&auth_config) {
             record_program(value, &mut needed);
-            if let Err(error) = secret::resolve(key, value) {
-                problems.push(format!("{key}: {error}"));
+            match secret::resolve(key, value) {
+                Ok(resolved) => {
+                    if key == "auth.bearer_token"
+                        && let Err(error) = crate::config::validate_bearer_token(&resolved)
+                    {
+                        problems.push(error.to_string());
+                    }
+                }
+                Err(error) => problems.push(format!("{key}: {error}")),
             }
         }
     }
@@ -136,14 +160,6 @@ pub fn run(paths: &Paths, tool_config: &ToolConfig, as_json: bool) -> Result<usi
             }
             .to_string(),
         );
-    }
-
-    if !decision.bind.is_loopback() && use_proxy {
-        // The auth proxy listens on loopback and is the only intended entry point.
-        problems.push(format!(
-            "server.bind is {}: the hub itself has no authentication, so the proxy on port {} can be bypassed",
-            decision.bind, decision.proxy_port
-        ));
     }
 
     // Ports: bind and release, which is the cheapest honest answer.
@@ -357,9 +373,41 @@ fn command_available(command: &str) -> bool {
     }
 }
 
+/// Does this environment variable name look like it carries a credential?
+///
+/// A plain string is the only way to write a value into a server's `env`; this is a
+/// warning for the common mistake, not a hard rule (a server may legitimately have a
+/// non-secret variable whose name contains "KEY").
+fn looks_like_secret(key: &str) -> bool {
+    let key = key.to_ascii_uppercase();
+    [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "API_KEY",
+        "APIKEY",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
+        || key.ends_with("_KEY")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_like_names_are_recognised() {
+        assert!(looks_like_secret("GITHUB_TOKEN"));
+        assert!(looks_like_secret("AWS_SECRET_ACCESS_KEY"));
+        assert!(looks_like_secret("SERVICE_PASSWORD"));
+        assert!(looks_like_secret("SSH_KEY"));
+        assert!(!looks_like_secret("LOG_LEVEL"));
+        assert!(!looks_like_secret("PATH"));
+        assert!(!looks_like_secret("NODE_OPTIONS"));
+    }
 
     #[test]
     fn missing_commands_are_not_available() {

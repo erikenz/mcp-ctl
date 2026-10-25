@@ -360,10 +360,11 @@ pub fn mcp_endpoint_url(external_url: &str) -> String {
     }
 }
 
-fn validate_external_url(url: &str) -> Result<()> {
-    let rest = url
+pub(crate) fn validate_external_url(url: &str) -> Result<()> {
+    let (scheme, rest) = url
         .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
+        .map(|rest| ("https", rest))
+        .or_else(|| url.strip_prefix("http://").map(|rest| ("http", rest)))
         .ok_or_else(|| {
             anyhow!(
                 "server.external_url must start with http:// or https:// (got '{url}'), \
@@ -372,6 +373,44 @@ fn validate_external_url(url: &str) -> Result<()> {
         })?;
     if rest.is_empty() || rest.starts_with('/') || url.contains(char::is_whitespace) {
         bail!("server.external_url is not a valid URL: '{url}'");
+    }
+    // The auth proxy puts OAuth codes, passwords and bearer tokens on this URL. Plain HTTP
+    // is only acceptable when the whole exchange stays on this machine.
+    if scheme == "http" && !is_loopback_url_host(rest) {
+        bail!(
+            "server.external_url must use https:// for a public URL (got '{url}'); \
+             http:// is only allowed for localhost/loopback testing"
+        );
+    }
+    Ok(())
+}
+
+/// Does a URL authority (host[:port], without the scheme) name this machine?
+fn is_loopback_url_host(rest: &str) -> bool {
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.split(']').next())
+        .unwrap_or_else(|| host.split(':').next().unwrap_or(host));
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .map(|address| address.is_loopback())
+        .unwrap_or(false)
+}
+
+/// A bearer token is the only credential protecting a directly exposed hub, so a short
+/// one is not worth the false sense of security.
+pub const MIN_BEARER_TOKEN_LEN: usize = 16;
+
+pub fn validate_bearer_token(value: &str) -> Result<()> {
+    if value.len() < MIN_BEARER_TOKEN_LEN {
+        bail!(
+            "auth.bearer_token is too short: use at least {MIN_BEARER_TOKEN_LEN} characters of \
+             random data (for example `openssl rand -hex 32`)"
+        );
     }
     Ok(())
 }
@@ -623,6 +662,24 @@ mod tests {
         let resolved = absolute_path(Path::new("work/config.json")).unwrap();
         assert!(resolved.is_absolute(), "{}", resolved.display());
         assert!(resolved.ends_with("work/config.json"));
+    }
+
+    #[test]
+    fn a_bearer_token_must_be_long_enough() {
+        assert!(validate_bearer_token("short").is_err());
+        assert!(validate_bearer_token("0123456789abcdef").is_ok());
+        assert!(validate_bearer_token("0123456789abcdef0123456789abcdef").is_ok());
+    }
+
+    #[test]
+    fn a_public_external_url_must_be_https() {
+        assert!(validate_external_url("https://laptop.example.ts.net").is_ok());
+        assert!(validate_external_url("https://laptop.example.ts.net:8443/mcp").is_ok());
+        assert!(validate_external_url("http://laptop.example.ts.net").is_err());
+        assert!(validate_external_url("http://127.0.0.1:8080").is_ok());
+        assert!(validate_external_url("http://localhost:8080").is_ok());
+        assert!(validate_external_url("http://[::1]:8080").is_ok());
+        assert!(validate_external_url("http://192.168.1.5:8080").is_err());
     }
 
     #[test]

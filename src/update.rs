@@ -208,12 +208,18 @@ fn extract(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut archive = tar::Archive::new(decoder);
     for entry in archive.entries().context("could not read the archive")? {
         let mut entry = entry.context("could not read the archive")?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
         let path = entry.path().context("the archive has a bad path")?;
         if path.file_name().and_then(|name| name.to_str()) == Some("mcp-ctl") {
             let mut binary = Vec::new();
             entry
                 .read_to_end(&mut binary)
                 .context("could not read the binary from the archive")?;
+            if binary.is_empty() {
+                bail!("the archive contains an empty mcp-ctl");
+            }
             return Ok(binary);
         }
     }
@@ -261,6 +267,35 @@ mod tests {
     #[test]
     fn the_current_binary_has_a_release_asset() {
         assert!(!target_triple().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_directory_named_mcp_ctl_is_not_the_binary() {
+        let mut builder = tar::Builder::new(Vec::new());
+
+        let mut directory = tar::Header::new_gnu();
+        directory.set_entry_type(tar::EntryType::Directory);
+        directory.set_size(0);
+        directory.set_mode(0o755);
+        directory.set_cksum();
+        builder
+            .append_data(&mut directory, "mcp-ctl", std::io::empty())
+            .unwrap();
+
+        let mut file = tar::Header::new_gnu();
+        file.set_size(4);
+        file.set_mode(0o755);
+        file.set_cksum();
+        builder
+            .append_data(&mut file, "mcp-ctl", &b"bin\0"[..])
+            .unwrap();
+
+        let tar = builder.into_inner().unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &tar).unwrap();
+        let archive = encoder.finish().unwrap();
+
+        assert_eq!(extract(&archive).unwrap(), b"bin\0");
     }
 
     #[test]

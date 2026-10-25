@@ -121,7 +121,7 @@ fn a_bearer_token_protects_the_hub_without_an_external_url() {
     sandbox.config_json(
         r#"{ "auth": { "bearer_token": { "source": "env", "name": "MCP_CTL_TEST_TOKEN" } } }"#,
     );
-    sandbox.env_file("MCP_CTL_TEST_TOKEN=s3cret\n");
+    sandbox.env_file("MCP_CTL_TEST_TOKEN=0123456789abcdef\n");
 
     // No external_url and no mcp-auth-proxy: a bearer token is a complete method.
     let output = sandbox.run(&["up", "-d", "--no-tunnel", "--port=0"]);
@@ -165,7 +165,7 @@ fn a_bearer_token_protects_the_hub_without_an_external_url() {
         "POST",
         "/mcp",
         Some(&body),
-        &[("Authorization", "Bearer s3cret")],
+        &[("Authorization", "Bearer 0123456789abcdef")],
     );
     assert_eq!(allowed.status, 200, "{}", allowed.body);
     assert!(allowed.json()["result"]["tools"].is_array());
@@ -183,6 +183,21 @@ fn a_bearer_token_protects_the_hub_without_an_external_url() {
         "{}",
         String::from_utf8_lossy(&stop.stderr)
     );
+}
+
+#[test]
+fn a_short_bearer_token_is_refused() {
+    let sandbox = Sandbox::new("auth-short-bearer");
+    sandbox.mcp_json(&mcp_json_with(&[fake_server_entry("alpha", &[])]));
+    sandbox.config_json(
+        r#"{ "auth": { "bearer_token": { "source": "env", "name": "MCP_CTL_TEST_TOKEN" } } }"#,
+    );
+    sandbox.env_file("MCP_CTL_TEST_TOKEN=short\n");
+
+    let output = sandbox.run(&["up", "-d", "--no-tunnel", "--port=0"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("too short"), "{stderr}");
 }
 
 /// Wait for a file to appear with parseable JSON in it.

@@ -22,6 +22,10 @@ if (-not $Version) {
     $Version = $Version.TrimStart("v")
 }
 
+if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+    throw "invalid version '$Version': expected a release version such as 1.2.3"
+}
+
 $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
     "AMD64" { "x86_64" }
     # No aarch64 Windows build is published; the x64 binary runs under the

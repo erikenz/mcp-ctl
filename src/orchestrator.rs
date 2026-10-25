@@ -141,14 +141,17 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
     let external_url = decision.external_url.clone();
     let use_proxy = decision.use_proxy;
     let use_tunnel = decision.use_tunnel;
+    let tunnel_target = decision.tunnel_target;
     let use_auth = decision.use_auth;
 
     let bearer_token = if decision.use_bearer {
         match &auth_config.bearer_token {
-            Some(value) => Some(
-                secret::resolve("auth.bearer_token", value)
-                    .context("failed to resolve auth.bearer_token")?,
-            ),
+            Some(value) => {
+                let token = secret::resolve("auth.bearer_token", value)
+                    .context("failed to resolve auth.bearer_token")?;
+                crate::config::validate_bearer_token(&token)?;
+                Some(token)
+            }
             None => None,
         }
     } else {
@@ -316,15 +319,10 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
 
     let (tunnel_url_tx, tunnel_url_rx) = channel::<String>();
     if use_tunnel {
-        // With a bearer token the hub itself is the authenticated endpoint; only the
-        // external auth proxy needs the tunnel pointed at its port.
-        let tunnel_target =
-            tunnel_config
-                .port
-                .unwrap_or(if use_proxy { proxy_port } else { hub_port });
-        if let Some((name, child)) =
-            start_tunnel(tunnel_config.provider, tunnel_target, tunnel_url_tx)
-        {
+        // `exposure::decide` has already checked the target: with proxy auth it is the
+        // proxy port, and a target that would expose the unauthenticated hub was refused.
+        let target = tunnel_target.unwrap_or(if use_proxy { proxy_port } else { hub_port });
+        if let Some((name, child)) = start_tunnel(tunnel_config.provider, target, tunnel_url_tx) {
             children.push(ChildProc {
                 name,
                 child,

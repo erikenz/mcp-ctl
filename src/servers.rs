@@ -243,10 +243,22 @@ impl McpServer {
 /// Resolve every env entry of a server. Values stay in memory and are handed to
 /// the child process only.
 pub fn resolve_env(name: &str, server: &McpServer) -> Result<Vec<(String, String)>> {
+    resolve_env_with_timeout(name, server, None)
+}
+
+/// Resolve every env entry of a server, bounding each external lookup.
+///
+/// A caller that must come up even when a vault is locked (`up`) passes a timeout;
+/// the others wait as long as the program takes.
+pub fn resolve_env_with_timeout(
+    name: &str,
+    server: &McpServer,
+    timeout: Option<Duration>,
+) -> Result<Vec<(String, String)>> {
     let mut resolved = Vec::with_capacity(server.env.len());
     for (key, value) in &server.env {
         let from = secret::describe(value);
-        let value = secret::resolve(key, value)
+        let value = secret::resolve_with_timeout(key, value, timeout)
             .with_context(|| format!("failed to resolve {key} for '{name}' from {from}"))?;
         resolved.push((key.clone(), value));
     }

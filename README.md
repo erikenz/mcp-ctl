@@ -161,12 +161,13 @@ MCP_CTL_AUTH_PASSWORD=choose-a-strong-password
 
 **A password or token must not be written out in the profile file.** That file is one copy-paste away from being shared or committed, so mcp-ctl refuses a literal for `auth` and points at `.env`, a vault or the environment. There is no `{"source": "literal"}`. A plain string in a server's `env` is for settings that are not secret; mcp-ctl cannot tell whether a value is a credential, and `check` warns when the name looks like one. A secret placed in a server's `args` is part of the command line and is shown by `list` and `check`; use `env` instead.
 
-Four rules worth knowing:
+Five rules worth knowing:
 
 1. **What the config says wins.** A variable exported in your shell does not shadow a configured source; use `{"source": "env"}` to read the environment on purpose.
 2. **An empty result is an error.** An empty API key is almost always a locked vault or a mistyped command; a plain value is taken as it is.
 3. **Resolved secrets are never printed.** `-v` redacts credential-like headers and query strings; `--verbose-bodies` is for debugging only. A secret placed in `args` is not redacted.
 4. **Backends inherit the daemon's environment** unless `"env_clear": true` is set. A value read from `.env` is not exported; a value you exported in the shell is visible to every backend. Use `.env` (or `env_clear`) when only one server should see it.
+5. **One unavailable secret skips one server.** If `up` cannot resolve a server's secret (a locked vault, a missing CLI, or a lookup that does not finish within a few seconds), it logs a warning and serves the rest. `mcp-ctl check` reports every problem before you start.
 
 Environment overrides, useful in scripts and editors: `MCP_CTL_CONFIG_DIR` (where profiles and `.env` live), `MCP_CTL_PROFILE` (which profile to use), `MCP_CTL_STATE_DIR` (where the daemon state and log live).
 

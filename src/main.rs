@@ -17,7 +17,7 @@ mod update;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -245,6 +245,9 @@ fn run() -> Result<u8> {
         Commands::Stop { force } => daemon::stop(&paths, force)?,
         Commands::Restart(serve) => {
             let options = serve.into_options(cli.verbose, cli.verbose_bodies, &paths)?;
+            if std::io::stdin().is_terminal() {
+                preflight_secrets(&tool_config, &options);
+            }
             daemon::restart(&paths, &options)?;
         }
         Commands::Status { profile, json } => {
@@ -269,6 +272,28 @@ fn run() -> Result<u8> {
     }
 
     Ok(0)
+}
+
+/// Resolve the selected servers' secrets before a restart stops the running daemon.
+///
+/// A password manager that is locked can prompt here, in the foreground, while the old
+/// service is still up. Without this, the prompt happens during daemon startup, where a
+/// secret that takes longer than `SECRET_TIMEOUT` skips its server.
+fn preflight_secrets(tool_config: &ToolConfig, options: &UpOptions) {
+    let Ok(selected) = servers::select(&tool_config.mcp_servers, &options.names, options.all)
+    else {
+        return;
+    };
+    if selected.iter().all(|(_, server)| server.env.is_empty()) {
+        return;
+    }
+
+    outln!("Resolving server secrets before restart (unlock the vault if prompted)...");
+    for (name, server) in selected {
+        if let Err(error) = servers::resolve_env(name, server) {
+            errln!("warning: {error:#}");
+        }
+    }
 }
 
 /// Write the profile file and its `.env`, without overwriting anything that already exists.

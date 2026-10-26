@@ -264,6 +264,8 @@ mcp-ctl update           # installs it
 
 When a daemon is running, an interactive `mcp-ctl update` asks whether to restart it (or every running profile) on the new version. The prompt is skipped when stdin is not a terminal; run `mcp-ctl restart` in that case. The restart keeps the profile and profile file, but not extra `up` flags — repeat those with `mcp-ctl restart` if you used them.
 
+An interactive `mcp-ctl restart` resolves the selected servers' secrets before stopping the old daemon, so a locked vault prompts while the service is still up. Without a terminal, startup keeps its bounded secret lookup and skips a server that does not answer in time.
+
 The download is checked against the `.sha256` published beside it. That catches corruption and a network attacker who cannot alter both files, but it is **not a signature**: an attacker who can replace the release assets can replace the checksum too. For a stronger check, verify the build provenance the release workflow attaches:
 
 ```bash

@@ -460,7 +460,10 @@ pub struct Overrides {
 }
 
 /// Resolve every path, honouring the `--profile` and `--config` overrides.
-pub fn resolve_with(overrides: Overrides) -> Result<(Paths, ToolConfig)> {
+///
+/// This does not read the profile file. `update` uses it after replacing the binary,
+/// where a broken profile must not stand in the way of asking about a running daemon.
+pub fn paths_with(overrides: Overrides) -> Result<Paths> {
     // Make the roots absolute before a background daemon inherits them: a relative
     // `--config work.json` must keep pointing at the same file after `up -d`
     // detaches (and after a tray or `restart` re-launches the daemon).
@@ -485,6 +488,12 @@ pub fn resolve_with(overrides: Overrides) -> Result<(Paths, ToolConfig)> {
         paths.env_file = paths.config_dir.join(".env");
     }
 
+    Ok(paths)
+}
+
+/// Resolve every path and read the profile file.
+pub fn resolve_with(overrides: Overrides) -> Result<(Paths, ToolConfig)> {
+    let paths = paths_with(overrides)?;
     let tool_config = ToolConfig::load_from(&paths.config_file)?;
     tool_config.validate()?;
     Ok((paths, tool_config))

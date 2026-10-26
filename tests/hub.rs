@@ -513,6 +513,8 @@ fn a_secret_lookup_that_hangs_does_not_hold_up_the_daemon() {
     // cannot show. The server that needs it is skipped after the bounded lookup; the
     // others are served and `up -d` does not kill the daemon.
     let sandbox = Sandbox::new("hub-secret-timeout");
+    // Keep the test fast: the default is 30s, and this lookup is deliberately stuck.
+    sandbox.config_json(r#"{"server":{"secret_timeout_secs":1}}"#);
     let broken = r#""broken": {
         "command": "true",
         "serve": true,

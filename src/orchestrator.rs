@@ -25,12 +25,6 @@ use crate::{daemon, platform, secret};
 /// How often the supervisor checks whether a backend has died.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(2);
 
-/// How long one external secret lookup may take while starting.
-///
-/// A locked password manager may wait on an unlock prompt that a detached daemon
-/// cannot show. The server that needs that secret is skipped; the rest still start.
-const SECRET_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// A supervised child process (auth proxy or tunnel).
 struct ChildProc {
     name: &'static str,
@@ -153,9 +147,12 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
     let bearer_token = if decision.use_bearer {
         match &auth_config.bearer_token {
             Some(value) => {
-                let token =
-                    secret::resolve_with_timeout("auth.bearer_token", value, Some(SECRET_TIMEOUT))
-                        .context("failed to resolve auth.bearer_token")?;
+                let token = secret::resolve_with_timeout(
+                    "auth.bearer_token",
+                    value,
+                    server_config.secret_timeout(),
+                )
+                .context("failed to resolve auth.bearer_token")?;
                 crate::config::validate_bearer_token(&token)?;
                 Some(token)
             }
@@ -250,14 +247,15 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
         // One server's secret may be unavailable (a locked vault, a missing CLI, a
         // timed-out command). That is a reason to skip that server, not to refuse to
         // serve the others.
-        let env = match servers::resolve_env_with_timeout(name, server, Some(SECRET_TIMEOUT)) {
-            Ok(env) => env,
-            Err(error) => {
-                errln!("warning: skipping '{name}': {error:#}");
-                failed.push(name.as_str());
-                continue;
-            }
-        };
+        let env =
+            match servers::resolve_env_with_timeout(name, server, server_config.secret_timeout()) {
+                Ok(env) => env,
+                Err(error) => {
+                    errln!("warning: skipping '{name}': {error:#}");
+                    failed.push(name.as_str());
+                    continue;
+                }
+            };
         let timeouts = BackendTimeouts {
             handshake: BackendTimeouts::DEFAULT_HANDSHAKE,
             tool: server.tool_timeout(tool_timeout),
@@ -613,27 +611,27 @@ fn start_auth_proxy(
         // exactly what the hub serves at /mcp.
         .arg(format!("http://127.0.0.1:{hub_port}"));
 
+    let secret_timeout = server_config.secret_timeout();
     if let Some(password) = &auth.password {
-        let password =
-            secret::resolve_with_timeout("auth.password", password, Some(SECRET_TIMEOUT))
-                .context("failed to resolve auth.password")?;
+        let password = secret::resolve_with_timeout("auth.password", password, secret_timeout)
+            .context("failed to resolve auth.password")?;
         command.env("PASSWORD", password);
     }
     if let Some((id, secret)) = auth.github() {
-        let id = secret::resolve_with_timeout("auth.github_client_id", id, Some(SECRET_TIMEOUT))
+        let id = secret::resolve_with_timeout("auth.github_client_id", id, secret_timeout)
             .context("failed to resolve auth.github_client_id")?;
         let client_secret =
-            secret::resolve_with_timeout("auth.github_client_secret", secret, Some(SECRET_TIMEOUT))
+            secret::resolve_with_timeout("auth.github_client_secret", secret, secret_timeout)
                 .context("failed to resolve auth.github_client_secret")?;
         command
             .env("GITHUB_CLIENT_ID", id)
             .env("GITHUB_CLIENT_SECRET", client_secret);
     }
     if let Some((id, secret)) = auth.google() {
-        let id = secret::resolve_with_timeout("auth.google_client_id", id, Some(SECRET_TIMEOUT))
+        let id = secret::resolve_with_timeout("auth.google_client_id", id, secret_timeout)
             .context("failed to resolve auth.google_client_id")?;
         let client_secret =
-            secret::resolve_with_timeout("auth.google_client_secret", secret, Some(SECRET_TIMEOUT))
+            secret::resolve_with_timeout("auth.google_client_secret", secret, secret_timeout)
                 .context("failed to resolve auth.google_client_secret")?;
         command
             .env("GOOGLE_CLIENT_ID", id)

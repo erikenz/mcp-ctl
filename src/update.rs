@@ -92,6 +92,10 @@ fn offer_restart(version: &str, exe: &Path, overrides: &Overrides) {
         format!("mcp-ctl daemons are running ({labels}). Restart them on {version}?")
     };
 
+    outln!(
+        "note: restarting uses the profile defaults; extra `up` flags (tunnel, bind \
+         address, server list, verbose) are not remembered."
+    );
     if !confirm(&question) {
         outln!("Run `mcp-ctl restart` when you are ready.");
         return;

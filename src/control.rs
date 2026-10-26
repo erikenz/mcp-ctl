@@ -286,10 +286,15 @@ fn answer(
     stop: &Sender<()>,
 ) -> Result<()> {
     let mut line = String::new();
-    BufReader::new(stream)
+    let read = BufReader::new(stream)
         .take(MAX_CONTROL_LINE as u64)
         .read_line(&mut line)
         .context("failed to read the control request")?;
+    if read == 0 {
+        // `is_listening` checks a control port by connecting and closing without a
+        // request. That is a normal liveness probe, not a malformed request.
+        return Ok(());
+    }
     if line.len() >= MAX_CONTROL_LINE && !line.ends_with('\n') {
         bail!("control request is too long");
     }
@@ -605,12 +610,8 @@ mod tests {
         }
     }
 
-    fn spawn_daemon() -> (u16, String, std::sync::mpsc::Receiver<()>) {
-        let server = ControlServer::bind().expect("a loopback port is available");
-        let port = server.port();
-        let token = server.token().to_string();
-        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
-        let info = Arc::new(ControlInfo {
+    fn test_info() -> ControlInfo {
+        ControlInfo {
             pid: 4242,
             version: "test".to_string(),
             started_at: now_secs(),
@@ -620,10 +621,34 @@ mod tests {
             auth_methods: Vec::new(),
             log_file: PathBuf::from("test.log"),
             ready: Arc::new(AtomicBool::new(true)),
-        });
+        }
+    }
+
+    fn spawn_daemon() -> (u16, String, std::sync::mpsc::Receiver<()>) {
+        let server = ControlServer::bind().expect("a loopback port is available");
+        let port = server.port();
+        let token = server.token().to_string();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let info = Arc::new(test_info());
         let hub = Arc::new(Hub::new());
         let _daemon = std::thread::spawn(move || server.serve(info, hub, stop_tx));
         (port, token, stop_rx)
+    }
+
+    #[test]
+    fn a_liveness_probe_is_not_a_malformed_request() {
+        // `is_listening` and `wait_until_stopped` probe a control port by connecting
+        // and closing without sending anything. That must not reach the log as a
+        // warning about a malformed request.
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        drop(client);
+
+        let (stop_tx, _stop_rx) = std::sync::mpsc::channel();
+        answer(&server, "token", &test_info(), &Hub::new(), &stop_tx)
+            .expect("a liveness probe must not be reported as a malformed request");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "mcp-ctl"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.88"
 # No address here: crates.io prints this field, and the repository link is

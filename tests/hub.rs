@@ -477,6 +477,65 @@ fn a_second_daemon_is_refused() {
 }
 
 #[test]
+fn a_server_whose_secret_cannot_be_resolved_is_skipped() {
+    let sandbox = Sandbox::new("hub-secret-skip");
+    let broken = r#""broken": {
+        "command": "true",
+        "serve": true,
+        "env": {
+            "TOKEN": { "source": "command", "run": "mcp-ctl-definitely-missing-secret-command" }
+        }
+    }"#;
+    sandbox.mcp_json(&mcp_json_with(&[
+        fake_server_entry("alpha", &[]),
+        broken.to_string(),
+    ]));
+
+    // The daemon must start with the healthy server, not fail because one secret is
+    // unavailable.
+    let daemon = Daemon::start(sandbox);
+    let names = tools_at(daemon.hub_port);
+    assert!(names.contains(&"echo".to_string()), "{names:?}");
+
+    let log = std::fs::read_to_string(daemon.sandbox.state_dir().join("mcp-ctl.log"))
+        .expect("the daemon log is readable");
+    assert!(log.contains("skipping 'broken'"), "{log}");
+    assert!(
+        log.contains("mcp-ctl-definitely-missing-secret-command"),
+        "{log}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_secret_lookup_that_hangs_does_not_hold_up_the_daemon() {
+    // The reported case: `rbw` waits for an unlock prompt that a detached daemon
+    // cannot show. The server that needs it is skipped after the bounded lookup; the
+    // others are served and `up -d` does not kill the daemon.
+    let sandbox = Sandbox::new("hub-secret-timeout");
+    let broken = r#""broken": {
+        "command": "true",
+        "serve": true,
+        "env": {
+            "TOKEN": { "source": "command", "run": "sh", "args": ["-c", "sleep 30"] }
+        }
+    }"#;
+    sandbox.mcp_json(&mcp_json_with(&[
+        fake_server_entry("alpha", &[]),
+        broken.to_string(),
+    ]));
+
+    let daemon = Daemon::start(sandbox);
+    let names = tools_at(daemon.hub_port);
+    assert!(names.contains(&"echo".to_string()), "{names:?}");
+
+    let log = std::fs::read_to_string(daemon.sandbox.state_dir().join("mcp-ctl.log"))
+        .expect("the daemon log is readable");
+    assert!(log.contains("skipping 'broken'"), "{log}");
+    assert!(log.contains("did not finish within"), "{log}");
+}
+
+#[test]
 fn a_detached_daemon_and_restart_keep_the_config_override() {
     let sandbox = Sandbox::new("hub-overrides");
     // The default profile would serve nothing (and pick the default port); only the

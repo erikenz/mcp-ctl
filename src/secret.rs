@@ -6,12 +6,15 @@
 //! process's environment: they are never written to disk, never logged, and `SecretValue`
 //! (see `src/servers.rs`) redacts them in `Debug` output.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
+use crate::platform;
 use crate::servers::{SecretSource, SecretValue};
 
 /// The `.env` next to the profile files, read once at startup.
@@ -110,6 +113,19 @@ fn env_sources() -> String {
 /// set in mcp-ctl's own environment does *not* shadow a configured source. Use
 /// `{"source": "env", "name": "..."}` to opt into the environment explicitly.
 pub fn resolve(key: &str, value: &SecretValue) -> Result<String> {
+    resolve_with_timeout(key, value, None)
+}
+
+/// Resolve one secret, allowing each external program at most `timeout`.
+///
+/// `None` waits as long as the program takes, which is what `run` and `check` want.
+/// `up` passes a bound: a password manager waiting for an unlock or a pinentry prompt
+/// must cost one server, not the whole daemon.
+pub fn resolve_with_timeout(
+    key: &str,
+    value: &SecretValue,
+    timeout: Option<Duration>,
+) -> Result<String> {
     let resolved = match value {
         SecretValue::Literal(value) => value.clone(),
         SecretValue::Source(SecretSource::Env { name }) => {
@@ -117,10 +133,10 @@ pub fn resolve(key: &str, value: &SecretValue) -> Result<String> {
             env_value(name).ok_or_else(|| anyhow!("'{name}' is not set in {}", env_sources()))?
         }
         SecretValue::Source(SecretSource::Bitwarden { item, field }) => {
-            rbw_get(item, field.as_deref().unwrap_or("password"))?
+            rbw_get(item, field.as_deref().unwrap_or("password"), timeout)?
         }
-        SecretValue::Source(SecretSource::OnePassword { reference }) => op_get(reference)?,
-        SecretValue::Source(SecretSource::Command { run, args }) => cmd_get(run, args)?,
+        SecretValue::Source(SecretSource::OnePassword { reference }) => op_get(reference, timeout)?,
+        SecretValue::Source(SecretSource::Command { run, args }) => cmd_get(run, args, timeout)?,
     };
 
     // An empty secret is almost always a misconfiguration: a locked vault, an
@@ -158,13 +174,11 @@ pub fn describe(value: &SecretValue) -> String {
 ///
 /// Tries the custom field first, then falls back to `KEY=value` / `KEY: value`
 /// lines in the item's notes, so one item can carry a whole server's environment.
-fn rbw_get(item: &str, field: &str) -> Result<String> {
-    let output = Command::new("rbw")
-        .args(["get", "--field", field, item])
-        .output()
-        .map_err(|e| {
-            anyhow!("failed to run 'rbw' (is the Bitwarden CLI installed and in PATH?): {e}")
-        })?;
+fn rbw_get(item: &str, field: &str, timeout: Option<Duration>) -> Result<String> {
+    let mut command = Command::new("rbw");
+    command.args(["get", "--field", field, item]);
+    let output = output_within(&mut command, timeout)
+        .with_context(|| "failed to run 'rbw' (is the Bitwarden CLI installed and in PATH?)")?;
     if output.status.success() {
         let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !value.is_empty() {
@@ -172,10 +186,10 @@ fn rbw_get(item: &str, field: &str) -> Result<String> {
         }
     }
 
+    let mut notes_command = Command::new("rbw");
+    notes_command.args(["get", "--field", "notes", item]);
     if field != "password"
-        && let Ok(notes) = Command::new("rbw")
-            .args(["get", "--field", "notes", item])
-            .output()
+        && let Ok(notes) = output_within(&mut notes_command, timeout)
         && notes.status.success()
     {
         let notes = String::from_utf8_lossy(&notes.stdout);
@@ -212,14 +226,11 @@ fn rbw_get(item: &str, field: &str) -> Result<String> {
 }
 
 /// Ask the 1Password CLI for a secret reference: `op read <reference>`.
-fn op_get(reference: &str) -> Result<String> {
-    let output = Command::new("op")
-        .arg("read")
-        .arg(reference)
-        .output()
-        .map_err(|e| {
-            anyhow!("failed to run 'op' (is the 1Password CLI installed and in PATH?): {e}")
-        })?;
+fn op_get(reference: &str, timeout: Option<Duration>) -> Result<String> {
+    let mut command = Command::new("op");
+    command.arg("read").arg(reference);
+    let output = output_within(&mut command, timeout)
+        .with_context(|| "failed to run 'op' (is the 1Password CLI installed and in PATH?)")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         bail!("op read '{reference}' failed: {stderr}");
@@ -228,9 +239,11 @@ fn op_get(reference: &str) -> Result<String> {
 }
 
 /// Run an arbitrary command and use its trimmed stdout as the secret.
-fn cmd_get(run: &str, args: &[String]) -> Result<String> {
-    let output = Command::new(run).args(args).output().map_err(|e| {
-        anyhow!("failed to run secret command '{run}' (is it installed and in PATH?): {e}")
+fn cmd_get(run: &str, args: &[String], timeout: Option<Duration>) -> Result<String> {
+    let mut command = Command::new(run);
+    command.args(args);
+    let output = output_within(&mut command, timeout).with_context(|| {
+        format!("failed to run secret command '{run}' (is it installed and in PATH?)")
     })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -238,6 +251,63 @@ fn cmd_get(run: &str, args: &[String]) -> Result<String> {
         bail!("command `{run}` failed with {}: {stderr}", output.status);
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Run a secret-source program and collect its output, killing it after `timeout`.
+///
+/// A password manager that is waiting for an unlock prompt can block forever when it
+/// has no terminal to prompt on. The whole process group is stopped on timeout: `rbw`
+/// often has a `pinentry` child that would otherwise keep waiting on its own.
+fn output_within(command: &mut Command, timeout: Option<Duration>) -> Result<Output> {
+    let Some(timeout) = timeout else {
+        return Ok(command.output()?);
+    };
+
+    platform::isolate_process_group(command);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+
+    // Drain both pipes while waiting, so a program that fills one cannot deadlock
+    // before it gets the chance to exit.
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            // `terminate` reaps the child on success. If it could not stop it, do not
+            // wait: this deadline exists so a wedged program cannot block startup.
+            if platform::terminate(&mut child).is_ok() {
+                let _ = stdout.join();
+                let _ = stderr.join();
+            }
+            bail!("did not finish within {}s", timeout.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    Ok(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+/// Collect a pipe on its own thread, so the parent can keep waiting on the child.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    })
 }
 
 #[cfg(test)]
@@ -333,6 +403,39 @@ mod tests {
         });
         let error = resolve("KEY", &value).unwrap_err().to_string();
         assert!(error.contains("empty value"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_command_still_returns_its_value() {
+        let value = SecretValue::Source(SecretSource::Command {
+            run: "echo".to_string(),
+            args: vec!["hello-secret".to_string()],
+        });
+        assert_eq!(
+            resolve_with_timeout("KEY", &value, Some(Duration::from_secs(5))).unwrap(),
+            "hello-secret"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_never_finishes_is_stopped_at_the_deadline() {
+        // A locked password manager can wait on an unlock prompt forever. Startup must
+        // get an error back, not a thread parked in `wait`.
+        let value = SecretValue::Source(SecretSource::Command {
+            run: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 30".to_string()],
+        });
+        let started = std::time::Instant::now();
+        let error =
+            resolve_with_timeout("KEY", &value, Some(Duration::from_millis(200))).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("did not finish within"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the lookup must return at its deadline, not when the command ends"
+        );
     }
 
     #[test]

@@ -21,7 +21,10 @@ use crate::platform;
 /// How long `stop` waits for a daemon that was asked to shut down.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long a freshly spawned daemon has to start answering control requests.
+/// How long `up -d` waits for a freshly spawned daemon to report ready.
+///
+/// Reaching it is not fatal when the daemon answers control requests: it is then still
+/// connecting to backends, and `up -d` reports that instead of killing it.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How large the daemon log may grow before it is rotated as a daemon starts.
@@ -98,9 +101,24 @@ pub fn spawn_detached(paths: &Paths, args: &[String]) -> Result<u32> {
     loop {
         if let Some(state) = control::read_state(paths)?
             && state.pid == child.id()
-            && control::query_status(&state).is_some_and(|report| report.ready)
+            && let Some(report) = control::query_status(&state)
         {
-            return Ok(state.pid);
+            if report.ready {
+                return Ok(state.pid);
+            }
+            if Instant::now() >= deadline {
+                // The daemon is up and answering control requests; it is only still
+                // connecting to a backend. Killing it here would turn one slow server
+                // (a locked vault, a slow `npx` download) into a failed start for every
+                // other server too. `status` reports it as starting until it is ready.
+                errln!(
+                    "warning: {} is still connecting to its backends after {}s; it keeps \
+                     running in the background.\nCheck `mcp-ctl status` in a moment.",
+                    service_name(paths),
+                    STARTUP_TIMEOUT.as_secs()
+                );
+                return Ok(state.pid);
+            }
         }
         if let Ok(Some(status)) = child.try_wait() {
             bail!(
@@ -109,8 +127,8 @@ pub fn spawn_detached(paths: &Paths, args: &[String]) -> Result<u32> {
             );
         }
         if Instant::now() >= deadline {
-            // Do not leave the child we started behind: `up -d` said it failed, so
-            // nothing should still be serving.
+            // Nothing answered control requests, so there is no service to keep: do not
+            // leave the child we started behind.
             let _ = platform::terminate(&mut child);
             bail!(
                 "mcp-ctl did not start within {}s.\nLast log lines:\n{}",

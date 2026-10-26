@@ -278,7 +278,7 @@ fn run() -> Result<u8> {
 ///
 /// A password manager that is locked can prompt here, in the foreground, while the old
 /// service is still up. Without this, the prompt happens during daemon startup, where a
-/// secret that takes longer than `SECRET_TIMEOUT` skips its server.
+/// secret that takes longer than `server.secret_timeout_secs` skips its server.
 fn preflight_secrets(tool_config: &ToolConfig, options: &UpOptions) {
     let Ok(selected) = servers::select(&tool_config.mcp_servers, &options.names, options.all)
     else {

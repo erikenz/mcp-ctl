@@ -18,6 +18,7 @@ pub const DEFAULT_CONFIG_JSON: &str = r#"{
         "listen_port": 37373,
         "proxy_port": 8080,
         "tool_timeout_secs": 300,
+        "secret_timeout_secs": 30,
         "allowed_origins": []
     },
     "tunnel": {
@@ -101,6 +102,9 @@ pub struct ServerConfig {
     /// Timeout for a single backend tool call, in seconds. 0 disables the timeout.
     #[serde(default = "default_tool_timeout_secs")]
     pub tool_timeout_secs: u64,
+    /// Timeout for one external secret lookup during startup, in seconds. 0 waits forever.
+    #[serde(default = "default_secret_timeout_secs")]
+    pub secret_timeout_secs: u64,
     /// Extra browser origins allowed to call the hub. An origin on a host mcp-ctl is served on
     /// (loopback, `bind`, `external_url`) is allowed without being listed; anything else is not.
     #[serde(default)]
@@ -116,6 +120,7 @@ impl Default for ServerConfig {
             external_url: None,
             auth_proxy_path: None,
             tool_timeout_secs: default_tool_timeout_secs(),
+            secret_timeout_secs: default_secret_timeout_secs(),
             allowed_origins: Vec::new(),
         }
     }
@@ -137,6 +142,15 @@ impl ServerConfig {
             Some(Duration::from_secs(self.tool_timeout_secs))
         }
     }
+
+    /// The external secret-lookup timeout; `None` means "wait as long as it takes".
+    pub fn secret_timeout(&self) -> Option<Duration> {
+        if self.secret_timeout_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(self.secret_timeout_secs))
+        }
+    }
 }
 
 pub fn default_bind() -> IpAddr {
@@ -155,6 +169,10 @@ pub fn default_proxy_port() -> u16 {
 
 pub fn default_tool_timeout_secs() -> u64 {
     300
+}
+
+pub fn default_secret_timeout_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -633,6 +651,26 @@ mod tests {
     fn tray_disabled_by_default() {
         let cfg: ToolConfig = serde_json::from_str("{\"server\": {\"listen_port\": 1}}").unwrap();
         assert!(!cfg.tray().enabled);
+    }
+
+    #[test]
+    fn the_secret_timeout_defaults_to_30_seconds() {
+        assert_eq!(
+            config(r#"{"mcpServers":{}}"#).server().secret_timeout(),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            config(r#"{"server":{"secret_timeout_secs":60},"mcpServers":{}}"#)
+                .server()
+                .secret_timeout(),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            config(r#"{"server":{"secret_timeout_secs":0},"mcpServers":{}}"#)
+                .server()
+                .secret_timeout(),
+            None
+        );
     }
 
     #[test]

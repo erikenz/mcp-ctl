@@ -122,6 +122,7 @@ Every key is optional. Out of the box mcp-ctl serves `"serve": true` entries on 
 | `server.external_url` | — | Public URL clients use, for OAuth callbacks and browser origins. Required once `mcp-auth-proxy` is enabled; Tailscale can supply it. Must be `https://` unless it is a loopback URL for local testing. |
 | `server.auth_proxy_path` | — | Where `mcp-auth-proxy` lives, if it is not on `PATH`. |
 | `server.tool_timeout_secs` | `300` | How long one backend tool call may take; `0` waits forever. |
+| `server.secret_timeout_secs` | `30` | How long one external secret lookup may take while starting; a timeout skips that server. `0` waits forever. |
 | `server.allowed_origins` | `[]` | Extra browser origins allowed to call the hub. Origins on a host mcp-ctl is served on are allowed without being listed. |
 | `tunnel.provider` | `none` | `none`, `tailscale` or `cloudflared`. |
 | `tunnel.auto_start` | `true` | Start the tunnel when a provider is configured. |
@@ -167,7 +168,7 @@ Five rules worth knowing:
 2. **An empty result is an error.** An empty API key is almost always a locked vault or a mistyped command; a plain value is taken as it is.
 3. **Resolved secrets are never printed.** `-v` redacts credential-like headers and query strings; `--verbose-bodies` is for debugging only. A secret placed in `args` is not redacted.
 4. **Backends inherit the daemon's environment** unless `"env_clear": true` is set. A value read from `.env` is not exported; a value you exported in the shell is visible to every backend. Use `.env` (or `env_clear`) when only one server should see it.
-5. **One unavailable secret skips one server.** If `up` cannot resolve a server's secret (a locked vault, a missing CLI, or a lookup that does not finish within a few seconds), it logs a warning and serves the rest. `mcp-ctl check` reports every problem before you start.
+5. **One unavailable secret skips one server.** If `up` cannot resolve a server's secret (a locked vault, a missing CLI, or a lookup that does not finish within `server.secret_timeout_secs`, 30 seconds by default), it logs a warning and serves the rest. An interactive `mcp-ctl restart` resolves secrets first and waits as long as the unlock takes. `mcp-ctl check` reports every problem before you start.
 
 Environment overrides, useful in scripts and editors: `MCP_CTL_CONFIG_DIR` (where profiles and `.env` live), `MCP_CTL_PROFILE` (which profile to use), `MCP_CTL_STATE_DIR` (where the daemon state and log live).
 
@@ -264,7 +265,7 @@ mcp-ctl update           # installs it
 
 When a daemon is running, an interactive `mcp-ctl update` asks whether to restart it (or every running profile) on the new version. The prompt is skipped when stdin is not a terminal; run `mcp-ctl restart` in that case. The restart keeps the profile and profile file, but not extra `up` flags — repeat those with `mcp-ctl restart` if you used them.
 
-An interactive `mcp-ctl restart` resolves the selected servers' secrets before stopping the old daemon, so a locked vault prompts while the service is still up. Without a terminal, startup keeps its bounded secret lookup and skips a server that does not answer in time.
+An interactive `mcp-ctl restart` resolves the selected servers' secrets before stopping the old daemon, so a locked vault prompts while the service is still up. Without a terminal, startup keeps its `server.secret_timeout_secs` bound and skips a server that does not answer in time.
 
 The download is checked against the `.sha256` published beside it. That catches corruption and a network attacker who cannot alter both files, but it is **not a signature**: an attacker who can replace the release assets can replace the checksum too. For a stronger check, verify the build provenance the release workflow attaches:
 

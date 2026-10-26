@@ -53,6 +53,12 @@
           "default": 300,
           "description": "How long one backend tool call may take. 0 waits forever."
         },
+        "secret_timeout_secs": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 30,
+          "description": "How long one external secret lookup may take while starting. A lookup that times out skips that server; 0 waits forever."
+        },
         "allowed_origins": {
           "type": "array",
           "items": {

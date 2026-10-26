@@ -192,7 +192,13 @@ fn run() -> Result<u8> {
     // directory the current user cannot read, must not stand in the way of
     // fixing the binary.
     if let Commands::Update { check } = &cli.command {
-        return update::run(*check);
+        return update::run(
+            *check,
+            Overrides {
+                config_file: cli.config.clone(),
+                profile: cli.profile.clone(),
+            },
+        );
     }
     let (paths, tool_config) = Paths::resolve_with(Overrides {
         config_file: cli.config.clone(),
@@ -211,7 +217,15 @@ fn run() -> Result<u8> {
         }
         // Handled at the top of this function, before the profile file is read;
         // repeated here so the match stays exhaustive without a panic.
-        Commands::Update { check } => return update::run(check),
+        Commands::Update { check } => {
+            return update::run(
+                check,
+                Overrides {
+                    config_file: cli.config.clone(),
+                    profile: cli.profile.clone(),
+                },
+            );
+        }
         Commands::Run { name } => {
             // On Unix this never returns: the server replaces this process.
             let code = servers::run(&name, &tool_config.mcp_servers)?;

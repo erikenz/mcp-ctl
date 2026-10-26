@@ -9,13 +9,18 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::io::Read;
+use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
+use std::process::Command;
+
+use crate::config::{self, DEFAULT_PROFILE, Overrides, Paths};
+use crate::control::{StateFile, StatusReport, query_status};
+use crate::daemon;
 
 const REPO: &str = "erikenz/mcp-ctl";
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
-pub fn run(check: bool) -> Result<u8> {
+pub fn run(check: bool, overrides: Overrides) -> Result<u8> {
     let release = latest_release()?;
     if !is_newer(&release.version, CURRENT) {
         println!("mcp-ctl {CURRENT} is up to date.");
@@ -49,7 +54,161 @@ pub fn run(check: bool) -> Result<u8> {
     }
     install(&release, &exe)?;
     println!("Updated to {}.", release.version);
+    offer_restart(&release.version, &exe, &overrides);
     Ok(0)
+}
+
+/// Offer to restart running daemons, so the new binary is actually in service.
+///
+/// The restart is a fresh `mcp-ctl restart`, not a request to the old process: that
+/// works with daemons from before this prompt existed, and it uses the binary that was
+/// just installed. The profile and profile file are kept; extra `up` flags are not.
+fn offer_restart(version: &str, exe: &Path, overrides: &Overrides) {
+    let running: Vec<(Paths, StateFile)> = running_daemons(overrides)
+        .into_iter()
+        .filter(|(_, state)| state.version != version)
+        .collect();
+    if running.is_empty() {
+        return;
+    }
+
+    if !std::io::stdin().is_terminal() {
+        outln!("Run `mcp-ctl restart` to put {version} into service.");
+        return;
+    }
+
+    let question = if let [(paths, state)] = running.as_slice() {
+        format!(
+            "mcp-ctl {} is running ({}). Restart it on {version}?",
+            state.version,
+            daemon_label(paths, state.pid)
+        )
+    } else {
+        let labels = running
+            .iter()
+            .map(|(paths, state)| daemon_label(paths, state.pid))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("mcp-ctl daemons are running ({labels}). Restart them on {version}?")
+    };
+
+    if !confirm(&question) {
+        outln!("Run `mcp-ctl restart` when you are ready.");
+        return;
+    }
+
+    for (paths, state) in running {
+        // Ask the old daemon for the ports and auth state so the restart keeps them,
+        // even when they came from `up` flags rather than the profile file.
+        let status = query_status(&state);
+        outln!("Restarting {}...", service_label(&paths));
+        if let Err(error) = restart(exe, &paths, status.as_ref()) {
+            errln!(
+                "warning: {} could not be restarted: {error:#}",
+                service_label(&paths)
+            );
+        }
+    }
+}
+
+/// Every running daemon this invocation should offer to restart.
+///
+/// An explicit `--profile`, `--config` or `MCP_CTL_PROFILE` means "just this one";
+/// otherwise every profile with a running daemon is offered.
+fn running_daemons(overrides: &Overrides) -> Vec<(Paths, StateFile)> {
+    let selected = overrides.profile.is_some()
+        || overrides.config_file.is_some()
+        || std::env::var_os("MCP_CTL_PROFILE").is_some();
+
+    let candidates: Vec<Paths> = if selected {
+        config::paths_with(overrides.clone()).into_iter().collect()
+    } else {
+        let (Ok(config_root), Ok(state_root)) = (config::config_dir(), config::state_dir()) else {
+            return Vec::new();
+        };
+        config::profiles(&config_root)
+            .into_iter()
+            .filter_map(|profile| {
+                config::paths_for_profile(&config_root, &state_root, &profile).ok()
+            })
+            .collect()
+    };
+
+    candidates
+        .into_iter()
+        .filter_map(|paths| {
+            daemon::running_state(&paths)
+                .ok()
+                .flatten()
+                .map(|state| (paths, state))
+        })
+        .collect()
+}
+
+/// Run the installed binary's own `restart`, keeping the profile and profile file.
+fn restart(exe: &Path, paths: &Paths, running: Option<&StatusReport>) -> Result<()> {
+    let status = Command::new(exe)
+        .args(restart_args(paths, running))
+        .status()
+        .with_context(|| format!("could not run {}", exe.display()))?;
+    if !status.success() {
+        bail!("`mcp-ctl restart` exited with {status}");
+    }
+    Ok(())
+}
+
+/// The global flags go before `restart`; the serve flags belong to it.
+///
+/// The running daemon's ports and auth state are passed on when they are known, so a
+/// `--port 0` or `--no-auth` start does not silently change on restart.
+fn restart_args(paths: &Paths, running: Option<&StatusReport>) -> Vec<String> {
+    let mut args = vec![
+        format!("--profile={}", paths.profile),
+        format!("--config={}", paths.config_file.display()),
+        "restart".to_string(),
+    ];
+    if let Some(running) = running {
+        args.push(format!("--port={}", running.hub_port));
+        if let Some(proxy_port) = running.proxy_port {
+            args.push(format!("--proxy-port={proxy_port}"));
+        }
+        if running.auth_methods.is_empty() {
+            args.push("--no-auth".to_string());
+        }
+    }
+    args
+}
+
+fn daemon_label(paths: &Paths, pid: u32) -> String {
+    if paths.profile == DEFAULT_PROFILE {
+        format!("PID {pid}")
+    } else {
+        format!("profile {}, PID {pid}", paths.profile)
+    }
+}
+
+fn service_label(paths: &Paths) -> String {
+    if paths.profile == DEFAULT_PROFILE {
+        "mcp-ctl".to_string()
+    } else {
+        format!("mcp-ctl ({})", paths.profile)
+    }
+}
+
+/// Ask a yes/no question, defaulting to no on EOF or a write error.
+fn confirm(question: &str) -> bool {
+    let mut stdout = std::io::stdout();
+    let _ = write!(stdout, "{question} [y/N] ");
+    let _ = stdout.flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    is_yes(&answer)
+}
+
+fn is_yes(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// Did the install script put this binary here?
@@ -252,6 +411,87 @@ mod tests {
         assert!(installer_owned(Path::new("/home/you/.local/bin/mcp-ctl")));
         assert!(!installer_owned(Path::new("/usr/bin/mcp-ctl")));
         assert!(!installer_owned(Path::new("/home/you/.cargo/bin/mcp-ctl")));
+    }
+
+    #[test]
+    fn only_y_and_yes_mean_restart() {
+        for answer in ["y", "Y", "yes", "YES\n", "  y  \n"] {
+            assert!(is_yes(answer), "{answer:?} should accept a restart");
+        }
+        for answer in ["", "n", "no", "\n", "maybe", "yep"] {
+            assert!(!is_yes(answer), "{answer:?} should not restart");
+        }
+    }
+
+    fn paths_for_restart() -> Paths {
+        Paths {
+            profile: "work".to_string(),
+            config_file: std::path::PathBuf::from("/tmp/config.work.json"),
+            env_file: std::path::PathBuf::from("/tmp/.env"),
+            state_file: std::path::PathBuf::from("/tmp/state/daemon.json"),
+            log_file: std::path::PathBuf::from("/tmp/state/mcp-ctl.log"),
+            state_dir: std::path::PathBuf::from("/tmp/state"),
+            config_dir: std::path::PathBuf::from("/tmp"),
+        }
+    }
+
+    fn status_for_restart() -> StatusReport {
+        StatusReport {
+            pid: 4242,
+            version: "0.1.0".to_string(),
+            uptime_secs: 10,
+            hub_port: 38001,
+            proxy_port: Some(38002),
+            external_url: None,
+            auth_methods: vec!["password".to_string()],
+            ready: true,
+            servers: Vec::new(),
+            total_tools: 0,
+            calls: 0,
+            log_file: std::path::PathBuf::from("/tmp/state/mcp-ctl.log"),
+        }
+    }
+
+    #[test]
+    fn a_restart_keeps_the_profile_and_profile_file() {
+        assert_eq!(
+            restart_args(&paths_for_restart(), None),
+            vec![
+                "--profile=work",
+                "--config=/tmp/config.work.json",
+                "restart"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_restart_keeps_the_running_ports_and_no_auth_state() {
+        let mut status = status_for_restart();
+        assert_eq!(
+            restart_args(&paths_for_restart(), Some(&status)),
+            vec![
+                "--profile=work",
+                "--config=/tmp/config.work.json",
+                "restart",
+                "--port=38001",
+                "--proxy-port=38002"
+            ]
+        );
+
+        // A daemon that exposes no auth method was started with `--no-auth` (or needs
+        // none); keep that decision on restart.
+        status.proxy_port = None;
+        status.auth_methods.clear();
+        assert_eq!(
+            restart_args(&paths_for_restart(), Some(&status)),
+            vec![
+                "--profile=work",
+                "--config=/tmp/config.work.json",
+                "restart",
+                "--port=38001",
+                "--no-auth"
+            ]
+        );
     }
 
     #[test]

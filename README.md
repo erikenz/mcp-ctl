@@ -103,7 +103,7 @@ mcp-ctl update            # update in place, when the install script owns the bi
 | `serve` | `false` | Whether `mcp-ctl up` serves this server without it being named on the command line. |
 | `enabled` | `true` | Set to `false` to keep an entry but ignore it everywhere. |
 | `prefix` | — | Prefix this server's tool names, e.g. `github_create_issue`. |
-| `timeout_secs` | — | Overrides `server.tool_timeout_secs` for this server; `0` waits forever. |
+| `timeout_secs` | — | Overrides `server.tool_timeout_secs` for this server; `0` waits forever, the maximum is `86400` (24 hours). |
 | `tools.include` / `tools.exclude` | — | Publish only some of the server's tools. A pattern is a tool name or a prefix ending in `*`. |
 | `env_clear` | `false` | Start the server with an empty environment instead of inheriting mcp-ctl's. |
 | `cwd` | — | Working directory for a stdio server. |
@@ -121,8 +121,8 @@ Every key is optional. Out of the box mcp-ctl serves `"serve": true` entries on 
 | `server.proxy_port` | `8080` | Port the auth proxy listens on. `0` is not supported: the tunnel target and `status` need the real port. |
 | `server.external_url` | — | Public URL clients use, for OAuth callbacks and browser origins. Required once `mcp-auth-proxy` is enabled; Tailscale can supply it. Must be `https://` unless it is a loopback URL for local testing. |
 | `server.auth_proxy_path` | — | Where `mcp-auth-proxy` lives, if it is not on `PATH`. |
-| `server.tool_timeout_secs` | `300` | How long one backend tool call may take; `0` waits forever. |
-| `server.secret_timeout_secs` | `30` | How long one external secret lookup may take while starting; a timeout skips that server. `0` waits forever. |
+| `server.tool_timeout_secs` | `300` | How long one backend tool call may take; `0` waits forever, the maximum is `86400` (24 hours). |
+| `server.secret_timeout_secs` | `30` | How long one external secret lookup may take while starting; a timeout skips that server. `0` waits forever, the maximum is `86400` (24 hours). |
 | `server.allowed_origins` | `[]` | Extra browser origins allowed to call the hub. Origins on a host mcp-ctl is served on are allowed without being listed. |
 | `tunnel.provider` | `none` | `none`, `tailscale` or `cloudflared`. |
 | `tunnel.auto_start` | `true` | Start the tunnel when a provider is configured. |
@@ -204,6 +204,8 @@ Four rules are enforced rather than warned about:
 - `--config` and `--profile` are remembered by a detached daemon, so `mcp-ctl --profile work up -d` and a later `restart` keep serving the work profile.
 
 A background service logs to `~/.local/state/mcp-ctl/mcp-ctl.log` on Linux, `~/Library/Application Support/mcp-ctl/` on macOS and `%LOCALAPPDATA%\mcp-ctl\` on Windows; `mcp-ctl status` prints the exact path. The log rotates at 5 MiB when a daemon starts, so a service that runs for months should also be rotated by the system. `mcp-ctl stop --force` kills a daemon that answers the control channel but will not exit; mcp-ctl never signals a process it cannot identify.
+
+On Linux, `up -d` starts the daemon in its own transient systemd scope (`systemd-run --user --scope`), so it is not part of the terminal's cgroup. Closing that terminal — or systemd-oomd killing its scope under memory pressure — no longer stops the service. The scope inherits your environment and working directory, so `PATH` and relative server paths behave exactly as before; `systemctl --user list-units 'mcpctl-*'` shows it while it runs. Without a usable systemd user manager, mcp-ctl falls back to a plain detached process and prints a warning. The systemd unit below is still the way to start the service on login and have it restarted automatically.
 
 A tunnel forwards to `tunnel.port`. With proxy auth, leave it unset so the tunnel reaches the proxy; pointing it at the hub would publish the unauthenticated hub and is refused. Tailscale can name its own public URL, which mcp-ctl reads from `tailscale status --json`; a Cloudflare quick tunnel picks a random hostname, which mcp-ctl reads from its output and `status` keeps showing.
 

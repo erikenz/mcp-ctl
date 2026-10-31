@@ -139,7 +139,9 @@ impl ServerConfig {
         if self.tool_timeout_secs == 0 {
             None
         } else {
-            Some(Duration::from_secs(self.tool_timeout_secs))
+            Some(Duration::from_secs(
+                self.tool_timeout_secs.min(MAX_TIMEOUT_SECS),
+            ))
         }
     }
 
@@ -148,7 +150,9 @@ impl ServerConfig {
         if self.secret_timeout_secs == 0 {
             None
         } else {
-            Some(Duration::from_secs(self.secret_timeout_secs))
+            Some(Duration::from_secs(
+                self.secret_timeout_secs.min(MAX_TIMEOUT_SECS),
+            ))
         }
     }
 }
@@ -174,6 +178,12 @@ pub fn default_tool_timeout_secs() -> u64 {
 pub fn default_secret_timeout_secs() -> u64 {
     30
 }
+
+/// Longest accepted tool or secret timeout (24 hours).
+///
+/// A larger value is a typo, and `Instant::now() + Duration::from_secs(u64::MAX)`
+/// panics — inside a backend lock, which would poison that server permanently.
+pub const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -321,8 +331,31 @@ impl ToolConfig {
             if let Some(url) = &server.external_url {
                 validate_external_url(url)?;
             }
+            if server.tool_timeout_secs > MAX_TIMEOUT_SECS {
+                bail!(
+                    "server.tool_timeout_secs must be at most {MAX_TIMEOUT_SECS}s (got {}); 0 disables the timeout",
+                    server.tool_timeout_secs
+                );
+            }
+            if server.secret_timeout_secs > MAX_TIMEOUT_SECS {
+                bail!(
+                    "server.secret_timeout_secs must be at most {MAX_TIMEOUT_SECS}s (got {}); 0 waits forever",
+                    server.secret_timeout_secs
+                );
+            }
             for origin in &server.allowed_origins {
                 validate_origin(origin)?;
+            }
+        }
+
+        for (name, server) in &self.mcp_servers {
+            if server
+                .timeout_secs
+                .is_some_and(|secs| secs > MAX_TIMEOUT_SECS)
+            {
+                bail!(
+                    "mcpServers.{name}.timeout_secs must be at most {MAX_TIMEOUT_SECS}s; 0 disables the timeout"
+                );
             }
         }
 
@@ -671,6 +704,24 @@ mod tests {
                 .secret_timeout(),
             None
         );
+    }
+
+    #[test]
+    fn an_unreasonably_large_timeout_is_rejected() {
+        // `Instant::now() + Duration::from_secs(u64::MAX)` panics, and the tool-call
+        // path does that while holding the backend lock.
+        let error =
+            config(r#"{"server":{"tool_timeout_secs":18446744073709551615},"mcpServers":{}}"#)
+                .validate()
+                .expect_err("an overflowing timeout must be refused");
+        assert!(error.to_string().contains("tool_timeout_secs"), "{error}");
+
+        let error = config(
+            r#"{"mcpServers":{"github":{"command":"true","timeout_secs":18446744073709551615}}}"#,
+        )
+        .validate()
+        .expect_err("a per-server overflowing timeout must be refused");
+        assert!(error.to_string().contains("timeout_secs"), "{error}");
     }
 
     #[test]

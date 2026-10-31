@@ -205,6 +205,10 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
     // Flipped once the backends are connected, so `up -d` reports success only when
     // the service really serves.
     let ready = Arc::new(AtomicBool::new(false));
+    // Flipped when a component the service cannot live without has died. The
+    // supervisor turns it into a non-zero exit, so systemd can restart the daemon.
+    let component_failed = Arc::new(AtomicBool::new(false));
+    let running = Arc::new(AtomicBool::new(true));
 
     // Answer control requests *before* the state file exists. `status` and `stop` must
     // reach a daemon that replies the moment it is advertised, and a second `up` must
@@ -216,6 +220,7 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
         version: env!("CARGO_PKG_VERSION").to_string(),
         started_at: state.started_at,
         hub_port,
+        hub_bind: bind,
         proxy_port: state.proxy_port,
         external_url: Arc::clone(&public_url),
         auth_methods: auth_methods.clone(),
@@ -224,7 +229,26 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
     });
     let control_hub = Arc::clone(&hub);
     let control_stop = stop_tx.clone();
-    std::thread::spawn(move || control.serve(control_info, control_hub, control_stop));
+    let control_panic_stop = stop_tx.clone();
+    let control_running = Arc::clone(&running);
+    let control_failed = Arc::clone(&component_failed);
+    std::thread::Builder::new()
+        .name("control".to_string())
+        .spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                control.serve(control_info, control_hub, control_stop);
+            }));
+            // A panic here makes the daemon unmanageable (`status`/`stop` stop
+            // answering), so treat it like a failed component instead of leaving a
+            // process that only `kill -9` can reach.
+            if outcome.is_err() && control_running.load(Ordering::SeqCst) {
+                errln!("error: the control channel panicked; stopping the service");
+                control_failed.store(true, Ordering::SeqCst);
+                control_running.store(false, Ordering::SeqCst);
+                let _ = control_panic_stop.send(());
+            }
+        })
+        .context("failed to start the control channel")?;
     // Claim the daemon slot before advertising it: `create_new` is atomic, so two `up`
     // started at the same moment cannot both proceed. The claim records the control
     // port this process is already listening on.
@@ -292,8 +316,6 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
     ready.store(true, Ordering::SeqCst);
 
     // --- Shutdown wiring ----------------------------------------------------
-    let running = Arc::new(AtomicBool::new(true));
-
     let signal_running = Arc::clone(&running);
     let signal_stop = stop_tx.clone();
     ctrlc::set_handler(move || {
@@ -306,11 +328,31 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
 
     let http_hub = Arc::clone(&hub);
     let http_running = Arc::clone(&running);
-    let http_thread = std::thread::spawn(move || {
-        if let Err(error) = http.serve(http_hub, http_options, http_running) {
-            errln!("warning: the HTTP endpoint stopped: {error}");
-        }
-    });
+    let http_stop = stop_tx.clone();
+    let http_failed = Arc::clone(&component_failed);
+    let http_thread = std::thread::Builder::new()
+        .name("http".to_string())
+        .spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                http.serve(http_hub, http_options, Arc::clone(&http_running))
+            }));
+            // A requested shutdown flips `running` before the endpoint returns, so
+            // anything else leaving this thread is a failure: clients would keep a
+            // bound port that never answers.
+            if !http_running.load(Ordering::SeqCst) {
+                return;
+            }
+            let reason = match outcome {
+                Ok(Ok(())) => "the HTTP endpoint stopped while it should be serving".to_string(),
+                Ok(Err(error)) => format!("the HTTP endpoint stopped: {error:#}"),
+                Err(_) => "the HTTP endpoint panicked".to_string(),
+            };
+            errln!("error: {reason}; stopping the service");
+            http_failed.store(true, Ordering::SeqCst);
+            http_running.store(false, Ordering::SeqCst);
+            let _ = http_stop.send(());
+        })
+        .context("failed to start the HTTP endpoint")?;
 
     // --- Optional auth proxy and tunnel -------------------------------------
     let mut children: Vec<ChildProc> = Vec::new();
@@ -409,6 +451,7 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
     let supervisor = Supervisor {
         hub: Arc::clone(&hub),
         running: Arc::clone(&running),
+        failed: Arc::clone(&component_failed),
         stop_rx,
         tray_rx,
         tunnel_url_rx,
@@ -423,7 +466,10 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
     // one. Everywhere else the supervisor stays here and the tray runs beside it.
     let outcome = match tray {
         Some(handle) if handle.needs_main_thread() => {
-            let worker = std::thread::spawn(move || supervisor.run());
+            let worker = std::thread::Builder::new()
+                .name("supervisor".to_string())
+                .spawn(move || supervisor.run())
+                .context("failed to start the supervisor thread")?;
             handle.run(Arc::clone(&running));
             match worker.join() {
                 Ok(outcome) => outcome,
@@ -439,6 +485,10 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
         }
     };
     let _ = http_thread.join();
+
+    if matches!(outcome, Outcome::Failed) {
+        bail!("a required component stopped unexpectedly; see the log above");
+    }
 
     if matches!(outcome, Outcome::RestartRequested) {
         let pid = daemon::spawn_detached(paths, &options.to_cli_args())?;
@@ -457,6 +507,8 @@ enum Outcome {
     Stopped,
     /// The service stopped because something asked for a restart.
     RestartRequested,
+    /// The HTTP endpoint or the control channel died; exit non-zero so it is restarted.
+    Failed,
 }
 
 /// Everything the running service owns after startup: the backends, the optional child
@@ -468,6 +520,7 @@ enum Outcome {
 struct Supervisor {
     hub: Arc<Hub>,
     running: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>,
     stop_rx: Receiver<()>,
     tray_rx: Receiver<TrayAction>,
     tunnel_url_rx: Receiver<String>,
@@ -510,7 +563,10 @@ impl Supervisor {
             // A tunnel that picks its own hostname (Cloudflare quick tunnels) only tells
             // us about it after the fact.
             if let Ok(url) = self.tunnel_url_rx.try_recv() {
-                let mut public = self.public_url.lock().unwrap();
+                let mut public = self
+                    .public_url
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if public.is_none() {
                     outln!("\nTunnel URL: {url}/mcp");
                     outln!(
@@ -569,7 +625,9 @@ impl Supervisor {
         }
         control::remove_state(&self.paths);
 
-        if restart_requested {
+        if self.failed.load(Ordering::SeqCst) {
+            Outcome::Failed
+        } else if restart_requested {
             Outcome::RestartRequested
         } else {
             Outcome::Stopped
@@ -674,8 +732,14 @@ fn start_tunnel(
     platform::isolate_process_group(&mut command);
     match command.spawn() {
         Ok(mut child) => {
-            if let Some(stderr) = child.stderr.take() {
-                std::thread::spawn(move || watch_tunnel_output(stderr, discovered_url));
+            if let Some(stderr) = child.stderr.take()
+                && let Err(error) = std::thread::Builder::new()
+                    .name("tunnel-output".to_string())
+                    .spawn(move || watch_tunnel_output(stderr, discovered_url))
+            {
+                errln!(
+                    "warning: failed to watch {name} output ({error}); the public URL will not be discovered"
+                );
             }
             Some((name, child))
         }

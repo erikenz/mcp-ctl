@@ -445,6 +445,7 @@ mod tests {
             version: "0.1.0".to_string(),
             uptime_secs: 10,
             hub_port: 38001,
+            hub_bind: std::net::Ipv4Addr::LOCALHOST.into(),
             proxy_port: Some(38002),
             external_url: None,
             auth_methods: vec!["password".to_string()],

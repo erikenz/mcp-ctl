@@ -11,10 +11,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{self, Paths, ToolConfig};
 use crate::control::{self, StateFile, StatusReport};
+use crate::http;
 use crate::orchestrator::UpOptions;
 use crate::platform;
 
@@ -82,9 +83,29 @@ pub fn spawn_detached(paths: &Paths, args: &[String]) -> Result<u32> {
         .try_clone()
         .context("failed to duplicate the log file handle")?;
 
-    let mut command = Command::new(&exe);
+    // `setsid` detaches the session but not the cgroup. Without a scope the daemon
+    // stays inside the terminal's transient scope, and closing that terminal — or
+    // systemd-oomd killing the scope under memory pressure — takes the daemon (and
+    // every MCP server it supervises) down with it. `systemd-run --scope` puts it in
+    // a sibling scope under `app.slice`. A scope is deliberate: unlike a transient
+    // service it inherits this process's environment and working directory, so PATH
+    // (mise, nvm, ...) and relative paths keep working exactly as before.
+    let (mut command, scope) = match scope_launch(&exe, args) {
+        Some((command, unit)) => (command, Some(unit)),
+        None => {
+            if cfg!(target_os = "linux") {
+                errln!(
+                    "warning: systemd-run is not available, so the daemon stays in this terminal's cgroup; \
+                     closing the terminal or an OOM kill of its scope will stop it. The systemd user \
+                     service in the README avoids this."
+                );
+            }
+            let mut command = Command::new(&exe);
+            command.args(args);
+            (command, None)
+        }
+    };
     command
-        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_errors));
@@ -99,28 +120,33 @@ pub fn spawn_detached(paths: &Paths, args: &[String]) -> Result<u32> {
     // Wait for the daemon to say it is serving, instead of guessing with a fixed sleep.
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
-        if let Some(state) = control::read_state(paths)?
-            && state.pid == child.id()
-            && let Some(report) = control::query_status(&state)
-        {
-            if report.ready {
-                return Ok(state.pid);
-            }
-            if Instant::now() >= deadline {
-                // The daemon is up and answering control requests; it is only still
-                // connecting to a backend. Killing it here would turn one slow server
-                // (a locked vault, a slow `npx` download) into a failed start for every
-                // other server too. `status` reports it as starting until it is ready.
-                errln!(
-                    "warning: {} is still connecting to its backends after {}s; it keeps \
-                     running in the background.\nCheck `mcp-ctl status` in a moment.",
-                    service_name(paths),
-                    STARTUP_TIMEOUT.as_secs()
-                );
-                return Ok(state.pid);
+        if let Some(state) = control::read_state(paths)? {
+            // A directly spawned daemon is our child. A scoped daemon is a child of
+            // `systemd-run`, so its PID differs; the state file (and the control token
+            // it carries) is the proof of identity. There was no state file before we
+            // started, so anything that appears now belongs to this launch.
+            let ours = scope.is_some() || state.pid == child.id();
+            if ours && let Some(report) = control::query_status(&state) {
+                if report.ready {
+                    return Ok(state.pid);
+                }
+                if Instant::now() >= deadline {
+                    // The daemon is up and answering control requests; it is only still
+                    // connecting to a backend. Killing it here would turn one slow server
+                    // (a locked vault, a slow `npx` download) into a failed start for every
+                    // other server too. `status` reports it as starting until it is ready.
+                    errln!(
+                        "warning: {} is still connecting to its backends after {}s; it keeps \
+                         running in the background.\nCheck `mcp-ctl status` in a moment.",
+                        service_name(paths),
+                        STARTUP_TIMEOUT.as_secs()
+                    );
+                    return Ok(state.pid);
+                }
             }
         }
         if let Ok(Some(status)) = child.try_wait() {
+            stop_launched(scope.as_deref());
             bail!(
                 "mcp-ctl failed to start in the background ({status}).\nLast log lines:\n{}",
                 tail(&paths.log_file, 10)
@@ -128,7 +154,9 @@ pub fn spawn_detached(paths: &Paths, args: &[String]) -> Result<u32> {
         }
         if Instant::now() >= deadline {
             // Nothing answered control requests, so there is no service to keep: do not
-            // leave the child we started behind.
+            // leave the child we started behind. For a scope this also stops whatever
+            // `systemd-run` started, in case the wrapper exited without its command.
+            stop_launched(scope.as_deref());
             let _ = platform::terminate(&mut child);
             bail!(
                 "mcp-ctl did not start within {}s.\nLast log lines:\n{}",
@@ -138,6 +166,68 @@ pub fn spawn_detached(paths: &Paths, args: &[String]) -> Result<u32> {
         }
         sleep(Duration::from_millis(100));
     }
+}
+
+/// The `systemd-run --scope` command that starts the daemon in its own cgroup, and
+/// the transient unit name that can stop it again.
+fn scope_launch(exe: &Path, args: &[String]) -> Option<(Command, String)> {
+    if !systemd_scope_available() {
+        return None;
+    }
+    // A unique unit name: only one daemon per profile can run, but a stale or
+    // concurrent scope with the same name would make `systemd-run` fail.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let unit = format!("mcpctl-{}-{nanos}", std::process::id());
+    let mut command = Command::new(platform::find_executable("systemd-run")?);
+    command
+        .arg("--user")
+        .arg("--scope")
+        .arg("--quiet")
+        .arg(format!("--unit={unit}"))
+        .arg("--")
+        .arg(exe)
+        .args(args);
+    Some((command, unit))
+}
+
+/// Is there a systemd user manager that can create a transient scope?
+fn systemd_scope_available() -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    let Some(systemctl) = platform::find_executable("systemctl") else {
+        return false;
+    };
+    let Ok(output) = Command::new(systemctl)
+        .args(["--user", "is-system-running"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    // `degraded` (exit 1) is common on a desktop and can still create scopes;
+    // `starting` is transient. Anything else means there is no usable user manager.
+    matches!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "running" | "degraded" | "starting"
+    )
+}
+
+/// Stop a scope that a failed start may still be holding.
+fn stop_launched(unit: Option<&str>) {
+    let Some(unit) = unit else {
+        return;
+    };
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", &format!("{unit}.scope")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Stop the running daemon.
@@ -401,7 +491,23 @@ fn print_status(paths: &Paths, report: &StatusReport) {
         report.version,
         format_duration(report.uptime_secs)
     );
-    outln!("  Hub:      http://127.0.0.1:{}/mcp", report.hub_port);
+    // `0.0.0.0`/`::` accept loopback connections; a specific bind is probed at its
+    // real address so a LAN-only hub is not reported as broken.
+    let bind = if report.hub_bind.is_unspecified() {
+        if report.hub_bind.is_ipv6() {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        }
+    } else {
+        report.hub_bind
+    };
+    let host = if bind.is_ipv6() {
+        format!("[{bind}]")
+    } else {
+        bind.to_string()
+    };
+    outln!("  Hub:      http://{host}:{}/mcp", report.hub_port);
     if let Some(proxy_port) = report.proxy_port {
         let methods = if report.auth_methods.is_empty() {
             "no authentication configured".to_string()
@@ -438,6 +544,16 @@ fn print_status(paths: &Paths, report: &StatusReport) {
         );
     }
     outln!("  Log:      {}", report.log_file.display());
+
+    // The control channel answering only proves the daemon process is alive; the
+    // endpoint that clients use is a separate thread. A dead accept loop still holds
+    // the port, so ask it for a real HTTP response.
+    if report.ready && !http::is_serving(bind, report.hub_port) {
+        errln!(
+            "warning: the hub at {bind}:{} did not answer a health check; it may be wedged. Restart it with `mcp-ctl restart` (or `stop --force`).",
+            report.hub_port
+        );
+    }
 }
 
 /// `221` -> `3m 41s`.

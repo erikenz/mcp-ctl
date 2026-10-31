@@ -46,6 +46,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the client may take to read a response.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often a refused handler thread is reported. One line per starvation event is
+/// useful; one per connection would bury the log.
+const SPAWN_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Failed bearer attempts allowed in one window before the hub answers 429.
 const MAX_FAILED_AUTH: u64 = 100;
 const AUTH_WINDOW: Duration = Duration::from_secs(60);
@@ -125,6 +129,8 @@ impl HttpServer {
             .set_nonblocking(true)
             .context("failed to make the HTTP listener non-blocking")?;
 
+        let mut last_spawn_error: Option<Instant> = None;
+
         while running.load(Ordering::SeqCst) {
             let stream = match self.listener.accept() {
                 Ok((stream, _)) => stream,
@@ -145,19 +151,77 @@ impl HttpServer {
             let options = options.clone();
             let policy = Arc::clone(&policy);
             let limiter = Arc::clone(&limiter);
-            let in_flight = Arc::clone(&in_flight);
-            std::thread::spawn(move || {
-                let _guard = InFlight(in_flight);
-                if let Err(error) =
-                    serve_connection(stream, &hub, &options, &policy, &limiter, port)
-                {
-                    errln!("warning: failed to answer an HTTP request: {error}");
+            let connection_in_flight = Arc::clone(&in_flight);
+            // A refused thread must not take the accept loop down with it: answer this
+            // one connection with 503 and keep serving the rest. `std::thread::spawn`
+            // panics when the OS refuses (EAGAIN/ENOMEM under resource pressure), and
+            // that panic used to kill the whole endpoint silently.
+            let handler_stream = match stream.try_clone() {
+                Ok(handle) => handle,
+                Err(error) => {
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    errln!("warning: failed to duplicate an HTTP connection: {error}");
+                    continue;
                 }
-            });
+            };
+            let spawned = std::thread::Builder::new()
+                .name("http-connection".to_string())
+                .spawn(move || {
+                    let _guard = InFlight(connection_in_flight);
+                    if let Err(error) =
+                        serve_connection(stream, &hub, &options, &policy, &limiter, port)
+                    {
+                        errln!("warning: failed to answer an HTTP request: {error}");
+                    }
+                });
+            match spawned {
+                Ok(_) => drop(handler_stream),
+                Err(error) => {
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    let now = Instant::now();
+                    if last_spawn_error
+                        .is_none_or(|last| now.duration_since(last) >= SPAWN_LOG_INTERVAL)
+                    {
+                        errln!(
+                            "warning: cannot start an HTTP handler thread ({error}); answering 503 until the system recovers"
+                        );
+                        last_spawn_error = Some(now);
+                    }
+                    let _ = write_unavailable(handler_stream);
+                }
+            }
         }
 
         Ok(())
     }
+}
+
+/// Is the hub answering HTTP right now?
+///
+/// Used by `status`: a daemon whose accept loop died still holds its port, so a
+/// successful TCP connect proves nothing. Only a real request does.
+pub fn is_serving(bind: IpAddr, port: u16) -> bool {
+    let address = SocketAddr::new(bind, port);
+    let timeout = Duration::from_millis(750);
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let request = format!("GET /healthz HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut reply = Vec::with_capacity(32);
+    let mut buffer = [0u8; 32];
+    while reply.len() < 12 {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => reply.extend_from_slice(&buffer[..read]),
+            Err(_) => return false,
+        }
+    }
+    reply.starts_with(b"HTTP/1.1 200")
 }
 
 /// Decrements the in-flight counter however the connection ends.
@@ -1070,6 +1134,35 @@ impl AuthLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_healthy_endpoint_is_reported_as_serving() {
+        let localhost = IpAddr::from([127, 0, 0, 1]);
+        let listener = TcpListener::bind(SocketAddr::from((localhost, 0))).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+        assert!(is_serving(localhost, port));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_port_that_accepts_but_never_answers_is_not_serving() {
+        let localhost = IpAddr::from([127, 0, 0, 1]);
+        let listener = TcpListener::bind(SocketAddr::from((localhost, 0))).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            // Hold the connection open without saying anything: exactly what a daemon
+            // with a dead accept loop looks like from the outside.
+            let _stream = listener.accept();
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        assert!(!is_serving(localhost, port));
+        handle.join().unwrap();
+    }
 
     fn options(allowed: &[&str], external_url: Option<&str>) -> HttpOptions {
         HttpOptions {

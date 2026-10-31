@@ -19,13 +19,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::Paths;
 use crate::hub::Hub;
@@ -92,6 +92,8 @@ pub struct ControlInfo {
     pub version: String,
     pub started_at: u64,
     pub hub_port: u16,
+    /// Address the hub is bound to, so `status` can health-check the right host.
+    pub hub_bind: IpAddr,
     pub proxy_port: Option<u16>,
     pub external_url: Arc<Mutex<Option<String>>>,
     pub auth_methods: Vec<String>,
@@ -108,6 +110,9 @@ pub struct StatusReport {
     pub version: String,
     pub uptime_secs: u64,
     pub hub_port: u16,
+    /// Defaulted for a daemon from before this field existed, which bound loopback.
+    #[serde(default = "crate::config::default_bind")]
+    pub hub_bind: IpAddr,
     #[serde(default)]
     pub proxy_port: Option<u16>,
     #[serde(default)]
@@ -149,6 +154,7 @@ impl ControlInfo {
             version: self.version.clone(),
             uptime_secs: now_secs().saturating_sub(self.started_at),
             hub_port: self.hub_port,
+            hub_bind: self.hub_bind,
             proxy_port: self.proxy_port,
             external_url: self
                 .external_url
@@ -237,6 +243,7 @@ impl ControlServer {
     /// `status` or `stop` behind it.
     pub fn serve(self, info: Arc<ControlInfo>, hub: Arc<Hub>, stop: Sender<()>) {
         let in_flight = Arc::new(AtomicUsize::new(0));
+        let mut last_spawn_error: Option<Instant> = None;
         loop {
             let stream = match self.listener.accept() {
                 Ok((stream, _)) => stream,
@@ -257,14 +264,31 @@ impl ControlServer {
             let hub = Arc::clone(&hub);
             let stop = stop.clone();
             let guard = ControlGuard(Arc::clone(&in_flight));
-            std::thread::spawn(move || {
-                let _guard = guard;
-                let _ = stream.set_read_timeout(Some(CONTROL_TIMEOUT));
-                let _ = stream.set_write_timeout(Some(CONTROL_TIMEOUT));
-                if let Err(error) = answer(&stream, &token, &info, &hub, &stop) {
-                    errln!("warning: control request failed: {error}");
+            // A refused thread must not take the control channel down with it: the
+            // next request gets another chance instead of the daemon becoming
+            // unmanageable until it is killed by hand.
+            let spawned = std::thread::Builder::new()
+                .name("control-connection".to_string())
+                .spawn(move || {
+                    let _guard = guard;
+                    let _ = stream.set_read_timeout(Some(CONTROL_TIMEOUT));
+                    let _ = stream.set_write_timeout(Some(CONTROL_TIMEOUT));
+                    if let Err(error) = answer(&stream, &token, &info, &hub, &stop) {
+                        errln!("warning: control request failed: {error}");
+                    }
+                });
+            if let Err(error) = spawned {
+                // `guard` was dropped with the closure, so the counter is already back.
+                let now = Instant::now();
+                if last_spawn_error
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(30))
+                {
+                    errln!(
+                        "warning: cannot start a control connection thread ({error}); status and stop may fail until the system recovers"
+                    );
+                    last_spawn_error = Some(now);
                 }
-            });
+            }
         }
     }
 }
@@ -616,6 +640,7 @@ mod tests {
             version: "test".to_string(),
             started_at: now_secs(),
             hub_port: 37373,
+            hub_bind: Ipv4Addr::LOCALHOST.into(),
             proxy_port: None,
             external_url: Arc::new(Mutex::new(None)),
             auth_methods: Vec::new(),
@@ -804,6 +829,7 @@ mod tests {
             version: "test".to_string(),
             started_at: now_secs(),
             hub_port: 37373,
+            hub_bind: Ipv4Addr::LOCALHOST.into(),
             proxy_port: None,
             external_url: Arc::new(Mutex::new(None)),
             auth_methods: Vec::new(),

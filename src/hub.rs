@@ -7,14 +7,13 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use crate::platform;
@@ -153,7 +152,7 @@ pub struct ChildServer {
     name: String,
     child: Child,
     stdin: Option<ChildStdin>,
-    rx: Receiver<String>,
+    rx: Arc<MessageQueue>,
     next_id: u64,
     tools: Vec<Value>,
     /// Tool-call timeout; `None` waits as long as the tool takes.
@@ -163,10 +162,174 @@ pub struct ChildServer {
     dropped: Arc<AtomicU64>,
 }
 
-/// How many unsolicited messages we buffer from one backend before dropping them: a
-/// backend that logs aggressively must not be able to grow our memory while no
-/// request is in flight.
-const MESSAGE_BUFFER: usize = 4096;
+/// How many bytes of one backend's unsolicited output we buffer.
+///
+/// The bound used to be a message count, which put no ceiling on memory: 4096 lines
+/// of screenshot-sized payload is gigabytes. A backend may keep one message of any
+/// size while the queue is idle (that is what a response to an in-flight call looks
+/// like), but everything queued behind it has to fit in this budget.
+const MESSAGE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+
+/// Longest single message accepted from a backend.
+///
+/// A tool result larger than this is refused instead of being allowed to grow the
+/// daemon's memory without a bound. `take_snapshot` and friends are well below it.
+const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Take a lock without letting one panicked thread poison the whole service.
+fn mutex_lock<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn read_lock<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// One backend's stdout messages, bounded by bytes rather than by message count.
+struct MessageQueue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+    budget: usize,
+}
+
+#[derive(Default)]
+struct QueueState {
+    lines: VecDeque<String>,
+    bytes: usize,
+    closed: bool,
+}
+
+enum PushOutcome {
+    Accepted,
+    /// The queue is over budget, so the message was dropped.
+    Dropped,
+    /// The backend is being shut down; the reader should stop.
+    Closed,
+}
+
+#[derive(Debug)]
+enum RecvError {
+    Timeout,
+    Closed,
+}
+
+impl MessageQueue {
+    fn new(budget: usize) -> Self {
+        Self {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+            budget,
+        }
+    }
+
+    fn push(&self, line: String) -> PushOutcome {
+        let mut state = mutex_lock(&self.state);
+        if state.closed {
+            return PushOutcome::Closed;
+        }
+        // An idle queue accepts one message even when it is larger than the budget:
+        // dropping a response a caller is waiting for would turn a large tool result
+        // into a timeout. Anything queued behind it has to fit.
+        if !state.lines.is_empty() && state.bytes.saturating_add(line.len()) > self.budget {
+            return PushOutcome::Dropped;
+        }
+        state.bytes = state.bytes.saturating_add(line.len());
+        state.lines.push_back(line);
+        self.ready.notify_one();
+        PushOutcome::Accepted
+    }
+
+    fn close(&self) {
+        mutex_lock(&self.state).closed = true;
+        self.ready.notify_all();
+    }
+
+    fn recv(&self, timeout: Option<Duration>) -> Result<String, RecvError> {
+        let mut state = mutex_lock(&self.state);
+        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+        loop {
+            if let Some(line) = state.lines.pop_front() {
+                state.bytes = state.bytes.saturating_sub(line.len());
+                return Ok(line);
+            }
+            if state.closed {
+                return Err(RecvError::Closed);
+            }
+            state = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(RecvError::Timeout);
+                    }
+                    self.ready
+                        .wait_timeout(state, remaining)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .0
+                }
+                None => self
+                    .ready
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            };
+        }
+    }
+}
+
+/// What one call to `read_capped_line` found.
+enum CappedLine {
+    Line,
+    /// The line was longer than the cap and has been discarded in full.
+    TooLong,
+    /// The pipe reached EOF.
+    Eof,
+}
+
+/// Read one newline-terminated message, refusing to buffer more than `max` bytes.
+///
+/// An oversized line is discarded through its newline, so the next read starts at
+/// the next message instead of in the middle of the oversized one.
+fn read_capped_line<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<CappedLine> {
+    line.clear();
+    let mut limited = std::io::Read::take(&mut *reader, max as u64 + 1);
+    let read = limited.read_until(b'\n', line)?;
+    if read == 0 {
+        return Ok(CappedLine::Eof);
+    }
+    if line.len() > max {
+        if !line.ends_with(b"\n") {
+            discard_line(reader)?;
+        }
+        // Do not keep a message-sized buffer around for the rest of the run.
+        *line = Vec::new();
+        return Ok(CappedLine::TooLong);
+    }
+    Ok(CappedLine::Line)
+}
+
+/// Consume everything up to and including the next newline.
+fn discard_line<R: BufRead>(reader: &mut R) -> std::io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        if let Some(end) = available.iter().position(|byte| *byte == b'\n') {
+            reader.consume(end + 1);
+            return Ok(());
+        }
+        let length = available.len();
+        reader.consume(length);
+    }
+}
 
 impl ChildServer {
     /// Start a backend server and complete the MCP handshake.
@@ -211,38 +374,54 @@ impl ChildServer {
             }
         };
 
-        let (tx, rx): (SyncSender<String>, Receiver<String>) = sync_channel(MESSAGE_BUFFER);
+        let queue = Arc::new(MessageQueue::new(MESSAGE_BUFFER_BYTES));
+        let reader_queue = Arc::clone(&queue);
         let dropped = Arc::new(AtomicU64::new(0));
         let dropped_by_reader = Arc::clone(&dropped);
-        std::thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                match reader.read_until(b'\n', &mut line) {
-                    // EOF, or a read error: either way we are done here.
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-                // Decoded lossily on purpose: one stray non-UTF-8 byte (a log line, a
-                // latin-1 filename) must not look like the server having exited. The
-                // JSON parse in `request` skips whatever is not a response.
-                let text = String::from_utf8_lossy(&line).into_owned();
-                match tx.try_send(text) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
-                        dropped_by_reader.fetch_add(1, Ordering::Relaxed);
+        let thread_name = format!("backend-{name}");
+        if let Err(error) = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                let mut line = Vec::new();
+                loop {
+                    match read_capped_line(&mut reader, &mut line, MAX_MESSAGE_BYTES) {
+                        // EOF, or a read error: either way we are done here.
+                        Ok(CappedLine::Eof) | Err(_) => break,
+                        Ok(CappedLine::TooLong) => {
+                            dropped_by_reader.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        Ok(CappedLine::Line) => {}
                     }
-                    Err(TrySendError::Disconnected(_)) => break,
+                    // Decoded lossily only when it is not valid UTF-8: one stray byte
+                    // (a log line, a latin-1 filename) must not look like the server
+                    // having exited. The JSON parse in `request` skips anything that
+                    // is not a response.
+                    let text = match String::from_utf8(std::mem::take(&mut line)) {
+                        Ok(text) => text,
+                        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+                    };
+                    match reader_queue.push(text) {
+                        PushOutcome::Accepted => {}
+                        PushOutcome::Dropped => {
+                            dropped_by_reader.fetch_add(1, Ordering::Relaxed);
+                        }
+                        PushOutcome::Closed => break,
+                    }
                 }
-            }
-        });
+                reader_queue.close();
+            })
+        {
+            let _ = platform::terminate(&mut child);
+            bail!("failed to start the reader thread for MCP server '{name}': {error}");
+        }
 
         let mut server = Self {
             name: name.to_string(),
             child,
             stdin: Some(stdin),
-            rx,
+            rx: queue,
             next_id: 1,
             tools: Vec::new(),
             timeout: timeouts.tool,
@@ -274,14 +453,14 @@ impl ChildServer {
             "params": params
         }))?;
 
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
         loop {
             let raw = self.recv(method, timeout, deadline)?;
             let trimmed = raw.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            let Ok(message) = serde_json::from_str::<Value>(trimmed) else {
+            let Ok(mut message) = serde_json::from_str::<Value>(trimmed) else {
                 continue;
             };
             if message.get("id") != Some(&json!(id)) {
@@ -303,8 +482,10 @@ impl ChildServer {
                 }));
             }
 
-            return match message.get("result") {
-                Some(result) => Ok(result.clone()),
+            // Move the result out: a screenshot-sized payload is too large to copy
+            // just to keep the envelope alive.
+            return match message.get_mut("result").map(std::mem::take) {
+                Some(result) => Ok(result),
                 None => bail!(
                     "server '{}' answered '{method}' without a result",
                     self.name
@@ -320,21 +501,21 @@ impl ChildServer {
         timeout: Option<Duration>,
         deadline: Option<Instant>,
     ) -> Result<String> {
-        let received = match deadline {
+        let remaining = match deadline {
             Some(deadline) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return Err(self.timed_out(method, timeout));
                 }
-                self.rx.recv_timeout(remaining)
+                Some(remaining)
             }
-            None => self.rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            None => None,
         };
 
-        match received {
+        match self.rx.recv(remaining) {
             Ok(line) => Ok(line),
-            Err(RecvTimeoutError::Timeout) => Err(self.timed_out(method, timeout)),
-            Err(RecvTimeoutError::Disconnected) => Err(self.died(method)),
+            Err(RecvError::Timeout) => Err(self.timed_out(method, timeout)),
+            Err(RecvError::Closed) => Err(self.died(method)),
         }
     }
 
@@ -356,13 +537,25 @@ impl ChildServer {
     }
 
     fn timed_out(&self, method: &str, timeout: Option<Duration>) -> anyhow::Error {
+        let dropped = self.dropped.swap(0, Ordering::Relaxed);
+        let dropped_note = if dropped == 0 {
+            String::new()
+        } else {
+            format!(
+                "; {dropped} message(s) were dropped because the backend produced too much output"
+            )
+        };
         match timeout {
             Some(timeout) => anyhow!(
-                "server '{}' did not answer '{method}' within {}s",
+                "server '{}' did not answer '{method}' within {}s{}",
                 self.name,
-                timeout.as_secs()
+                timeout.as_secs(),
+                dropped_note
             ),
-            None => anyhow!("server '{}' stopped answering '{method}'", self.name),
+            None => anyhow!(
+                "server '{}' stopped answering '{method}'{dropped_note}",
+                self.name
+            ),
         }
     }
 
@@ -458,6 +651,13 @@ impl ChildServer {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default())
+    }
+}
+
+impl Drop for ChildServer {
+    /// Wake the reader thread so a dropped backend stops buffering its output.
+    fn drop(&mut self) {
+        self.rx.close();
     }
 }
 
@@ -597,7 +797,7 @@ impl Hub {
         // Publishing and registering happen under one lock, so the routes, the definitions
         // and the backend itself can never disagree.
         let (published, renamed) = {
-            let mut registry = self.registry.write().unwrap();
+            let mut registry = write_lock(&self.registry);
             let (published, renamed) =
                 registry.publish(spec.name, spec.prefix, spec.filter, &server.tools);
             registry.backends.insert(
@@ -666,7 +866,7 @@ impl Hub {
             "server/discover" => Some(self.discover(id)),
             "ping" => Some(rpc_result(id, json!({}))),
             "tools/list" => {
-                let tools = self.registry.read().unwrap().tools.clone();
+                let tools = read_lock(&self.registry).tools.clone();
                 Some(rpc_result(id, json!({ "tools": tools })))
             }
             "tools/call" => Some(self.tools_call(id, &params)),
@@ -717,7 +917,7 @@ impl Hub {
         // registry before touching a backend: locks are never held nested, which is what
         // makes the ordering deadlock-free.
         let (route, server) = {
-            let registry = self.registry.read().unwrap();
+            let registry = read_lock(&self.registry);
             let route = registry.routes.get(tool).cloned();
             let server = route
                 .as_ref()
@@ -747,7 +947,7 @@ impl Hub {
 
         self.calls.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
-        let result = server.lock().unwrap().call_tool(forwarded);
+        let result = mutex_lock(&server).call_tool(forwarded);
         let elapsed = started.elapsed();
 
         // Audit line: answers "did the agent call the deploy tool, and when?" without
@@ -784,7 +984,7 @@ impl Hub {
     /// Stop every backend, giving each one a moment to exit on its own.
     pub fn shutdown(&self) {
         let running: Vec<(String, Backend)> = {
-            let mut registry = self.registry.write().unwrap();
+            let mut registry = write_lock(&self.registry);
             let backends = std::mem::take(&mut registry.backends);
             registry.routes.clear();
             registry.tools.clear();
@@ -817,7 +1017,7 @@ impl Hub {
     pub fn drop_dead(&self) -> Vec<String> {
         let mut gone = Vec::new();
         {
-            let mut registry = self.registry.write().unwrap();
+            let mut registry = write_lock(&self.registry);
             for (name, backend) in registry.backends.iter_mut() {
                 if !backend.alive {
                     continue;
@@ -861,9 +1061,7 @@ impl Hub {
 
     /// Every backend, its tool count and whether it is still running.
     pub fn summarize(&self) -> Vec<(String, usize, bool)> {
-        self.registry
-            .read()
-            .unwrap()
+        read_lock(&self.registry)
             .backends
             .iter()
             .map(|(name, backend)| (name.clone(), backend.tools, backend.alive))
@@ -882,7 +1080,7 @@ impl Hub {
     }
 
     pub fn tool_count(&self) -> usize {
-        self.registry.read().unwrap().tools.len()
+        read_lock(&self.registry).tools.len()
     }
 
     /// How many tool calls this hub has forwarded since it started.
@@ -895,11 +1093,17 @@ impl Drop for Hub {
     /// Backstop for early exits (startup errors, panics): a hub never leaves its
     /// backend servers running. `shutdown` already drained them in the normal path.
     fn drop(&mut self) {
-        if let Ok(mut registry) = self.registry.write() {
-            for (_, backend) in std::mem::take(&mut registry.backends) {
-                if let Ok(mut server) = backend.server.lock() {
+        let mut registry = write_lock(&self.registry);
+        for (_, backend) in std::mem::take(&mut registry.backends) {
+            match backend.server.try_lock() {
+                Ok(mut server) => {
                     let _ = server.shutdown(Duration::from_millis(250));
-                } else {
+                }
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    let mut server = poisoned.into_inner();
+                    let _ = server.shutdown(Duration::from_millis(250));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
                     let _ = platform::terminate_group(backend.pid);
                 }
             }
@@ -910,6 +1114,52 @@ impl Drop for Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_oversized_backend_line_is_refused_and_the_stream_resyncs() {
+        let input = b"short\n0123456789abcdef\nnext\n";
+        let mut reader = BufReader::new(&input[..]);
+        let mut line = Vec::new();
+
+        assert!(matches!(
+            read_capped_line(&mut reader, &mut line, 8),
+            Ok(CappedLine::Line)
+        ));
+        assert_eq!(line, b"short\n");
+        assert!(matches!(
+            read_capped_line(&mut reader, &mut line, 8),
+            Ok(CappedLine::TooLong)
+        ));
+        assert!(matches!(
+            read_capped_line(&mut reader, &mut line, 8),
+            Ok(CappedLine::Line)
+        ));
+        assert_eq!(line, b"next\n");
+    }
+
+    #[test]
+    fn the_message_queue_is_bounded_by_bytes() {
+        let queue = MessageQueue::new(10);
+        assert!(matches!(
+            queue.push("12345".to_string()),
+            PushOutcome::Accepted
+        ));
+        assert!(matches!(
+            queue.push("67890".to_string()),
+            PushOutcome::Accepted
+        ));
+        assert!(matches!(queue.push("x".to_string()), PushOutcome::Dropped));
+        assert_eq!(queue.recv(None).unwrap(), "12345");
+
+        // An idle queue still accepts one big response, so a large tool result does
+        // not turn into a timeout.
+        let queue = MessageQueue::new(10);
+        assert!(matches!(queue.push("x".repeat(100)), PushOutcome::Accepted));
+        assert_eq!(queue.recv(None).unwrap().len(), 100);
+
+        queue.close();
+        assert!(matches!(queue.recv(None), Err(RecvError::Closed)));
+    }
 
     #[test]
     fn a_configured_prefix_always_applies() {

@@ -275,17 +275,17 @@ fn output_within(command: &mut Command, timeout: Option<Duration>) -> Result<Out
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
 
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now().checked_add(timeout);
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             // `terminate` reaps the child on success. If it could not stop it, do not
             // wait: this deadline exists so a wedged program cannot block startup.
             if platform::terminate(&mut child).is_ok() {
-                let _ = stdout.join();
-                let _ = stderr.join();
+                let _ = stdout.and_then(|handle| handle.join().ok());
+                let _ = stderr.and_then(|handle| handle.join().ok());
             }
             bail!("did not finish within {}s", timeout.as_secs());
         }
@@ -294,20 +294,30 @@ fn output_within(command: &mut Command, timeout: Option<Duration>) -> Result<Out
 
     Ok(Output {
         status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+        stdout: stdout
+            .map(|handle| handle.join().unwrap_or_default())
+            .unwrap_or_default(),
+        stderr: stderr
+            .map(|handle| handle.join().unwrap_or_default())
+            .unwrap_or_default(),
     })
 }
 
 /// Collect a pipe on its own thread, so the parent can keep waiting on the child.
-fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut bytes);
-        }
-        bytes
-    })
+///
+/// `None` when the OS refused the thread: the caller then simply has no output to
+/// show, instead of the whole command panicking under resource pressure.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+    std::thread::Builder::new()
+        .name("secret-output".to_string())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+        .ok()
 }
 
 #[cfg(test)]

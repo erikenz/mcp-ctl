@@ -289,21 +289,29 @@ mod platform {
         // D-Bus, and a slow or wedged panel must never stall the hub's control loop.
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            while !stop_thread.load(Ordering::SeqCst) {
-                if handle.update(|tray| tray.refresh()).is_none() {
-                    break; // The tray service is gone, nothing left to notify.
+        let spawned = std::thread::Builder::new()
+            .name("tray-refresh".to_string())
+            .spawn(move || {
+                while !stop_thread.load(Ordering::SeqCst) {
+                    if handle.update(|tray| tray.refresh()).is_none() {
+                        break; // The tray service is gone, nothing left to notify.
+                    }
+                    let mut waited = Duration::ZERO;
+                    while waited < REFRESH_INTERVAL && !stop_thread.load(Ordering::SeqCst) {
+                        std::thread::sleep(STOP_POLL);
+                        waited += STOP_POLL;
+                    }
                 }
-                let mut waited = Duration::ZERO;
-                while waited < REFRESH_INTERVAL && !stop_thread.load(Ordering::SeqCst) {
-                    std::thread::sleep(STOP_POLL);
-                    waited += STOP_POLL;
-                }
-            }
-            // Best effort: when the process exits, the D-Bus name is dropped and the
-            // host removes the icon on its own.
-            let _ = handle.shutdown();
-        });
+                // Best effort: when the process exits, the D-Bus name is dropped and the
+                // host removes the icon on its own.
+                let _ = handle.shutdown();
+            });
+        if let Err(error) = spawned {
+            errln!(
+                "Warning: the tray refresh thread could not start ({error}); continuing without a tray icon."
+            );
+            return None;
+        }
 
         outln!("Tray icon enabled.");
         Some(TrayHandle { stop })

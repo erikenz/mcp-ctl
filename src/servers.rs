@@ -234,7 +234,9 @@ impl McpServer {
     pub fn tool_timeout(&self, fallback: Option<Duration>) -> Option<Duration> {
         match self.timeout_secs {
             Some(0) => None,
-            Some(secs) => Some(Duration::from_secs(secs)),
+            Some(secs) => Some(Duration::from_secs(
+                secs.min(crate::config::MAX_TIMEOUT_SECS),
+            )),
             None => fallback,
         }
     }

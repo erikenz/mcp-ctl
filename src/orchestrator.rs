@@ -265,6 +265,53 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
     outln!("\nConnecting to backends...");
     let mut failed = Vec::new();
     for (name, server) in &selected {
+        let timeouts = BackendTimeouts {
+            handshake: BackendTimeouts::DEFAULT_HANDSHAKE,
+            tool: server.tool_timeout(tool_timeout),
+        };
+
+        // A remote server is connected over HTTP; a local one is spawned. The rest
+        // (filters, prefixes, failure handling) is identical.
+        if server.is_remote() {
+            let Some(url) = server.url.as_deref() else {
+                continue;
+            };
+            let headers = match servers::resolve_headers_with_timeout(
+                name,
+                server,
+                server_config.secret_timeout(),
+            ) {
+                Ok(headers) => headers,
+                Err(error) => {
+                    errln!("warning: skipping '{name}': {error:#}");
+                    failed.push(name.as_str());
+                    continue;
+                }
+            };
+            let oauth = match oauth_client(paths, name, server) {
+                Ok(client) => client,
+                Err(error) => {
+                    errln!("warning: skipping '{name}': {error:#}");
+                    failed.push(name.as_str());
+                    continue;
+                }
+            };
+            let spec = crate::hub::RemoteSpec {
+                name,
+                url,
+                headers,
+                oauth,
+                prefix: server.prefix.as_deref(),
+                filter: server.tools.as_ref(),
+                timeouts,
+            };
+            if let Err(error) = hub.add_remote(spec) {
+                errln!("warning: skipping '{name}': {error:#}");
+                failed.push(name.as_str());
+            }
+            continue;
+        }
+
         let Some(command) = &server.command else {
             continue;
         };
@@ -280,10 +327,6 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
                     continue;
                 }
             };
-        let timeouts = BackendTimeouts {
-            handshake: BackendTimeouts::DEFAULT_HANDSHAKE,
-            tool: server.tool_timeout(tool_timeout),
-        };
         let spec = BackendSpec {
             name,
             command,
@@ -700,6 +743,20 @@ fn start_auth_proxy(
     command
         .spawn()
         .with_context(|| format!("failed to start {binary}"))
+}
+
+/// The OAuth client for a remote server, or `None` when the profile supplies its own
+/// credential or turns authentication off.
+pub fn oauth_client(
+    paths: &Paths,
+    name: &str,
+    server: &McpServer,
+) -> Result<Option<crate::oauth::Client>> {
+    let url = match server.url.as_deref() {
+        Some(url) if server.auth.is_oauth() && !server.has_authorization_header() => url,
+        _ => return Ok(None),
+    };
+    Ok(Some(crate::oauth::Client::new(paths, name, url)?))
 }
 
 /// Start the configured tunnel; a missing tunnel binary is a warning, not a failure.

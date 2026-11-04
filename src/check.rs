@@ -9,6 +9,7 @@ use std::net::{SocketAddr, TcpListener};
 
 use crate::config::{Paths, ToolConfig, TunnelProvider};
 use crate::exposure;
+use crate::oauth;
 use crate::platform;
 use crate::secret;
 use crate::servers::{McpServer, SecretSource, SecretValue};
@@ -36,9 +37,71 @@ pub fn run(paths: &Paths, tool_config: &ToolConfig, as_json: bool) -> Result<usi
         if !server.enabled {
             status = "skipped";
             note = Some("\"enabled\" is false".to_string());
-        } else if !server.is_stdio() {
-            status = "skipped";
-            note = Some("only local stdio servers can be served".to_string());
+        } else if server.is_remote() {
+            // A remote server has no command to find, but its headers are secrets
+            // like any other and its sign-in state is worth reporting. Nothing here
+            // touches the network: `check` stays usable offline.
+            for (key, value) in &server.headers {
+                let source = secret::describe(value);
+                record_program(value, &mut needed);
+                if matches!(value, SecretValue::Literal(_)) && looks_like_secret(key) {
+                    notes.push(format!(
+                        "{name}: the {key} header looks like a secret but is a literal in the \
+                         profile file; use .env or a vault source"
+                    ));
+                }
+                match secret::resolve(key, value) {
+                    Ok(_) => findings.push(json!({"key": key, "source": source, "ok": true})),
+                    Err(error) => {
+                        status = "problem";
+                        problems.push(format!("{name}: {key}: {error}"));
+                        findings.push(json!({
+                            "key": key,
+                            "source": source,
+                            "ok": false,
+                            "error": error.to_string()
+                        }));
+                    }
+                }
+            }
+
+            if server.has_authorization_header() {
+                note = Some("authenticates with a configured Authorization header".to_string());
+            } else if server.auth.is_oauth() {
+                match server
+                    .url
+                    .as_deref()
+                    .map(|url| oauth::Client::new(paths, name, url))
+                {
+                    Some(Ok(client)) => match client.status() {
+                        Ok(Some(auth)) if !auth.expired() => {
+                            note = Some(format!("oauth: {}", auth.describe()));
+                        }
+                        Ok(Some(auth)) => {
+                            note = Some(format!("oauth token {}", auth.describe()));
+                            if !auth.has_refresh_token {
+                                notes.push(format!(
+                                    "{name}: the OAuth token expired; run `mcp-ctl auth login {name}`"
+                                ));
+                            }
+                        }
+                        Ok(None) => notes.push(format!(
+                            "{name}: no OAuth token yet; run `mcp-ctl auth login {name}`"
+                        )),
+                        Err(error) => {
+                            status = "problem";
+                            problems.push(format!("{name}: {error}"));
+                        }
+                    },
+                    Some(Err(error)) => {
+                        status = "problem";
+                        problems.push(format!("{name}: {error}"));
+                    }
+                    None => {}
+                }
+            } else {
+                note = Some("no authentication configured".to_string());
+            }
         } else {
             if let Some(command) = &server.command {
                 // Only a bare name is a PATH lookup worth listing under Programs. A
@@ -95,6 +158,7 @@ pub fn run(paths: &Paths, tool_config: &ToolConfig, as_json: bool) -> Result<usi
         reports.push(json!({
             "name": name,
             "status": status,
+            "url": server.url,
             "command": server.command_line(),
             "tools": server.tools.as_ref().map(|filter| filter.describe()),
             "env_clear": server.env_clear,
@@ -388,6 +452,9 @@ fn looks_like_secret(key: &str) -> bool {
         "CREDENTIAL",
         "API_KEY",
         "APIKEY",
+        // Header names that carry a credential in the clear.
+        "AUTHORIZATION",
+        "COOKIE",
     ]
     .iter()
     .any(|needle| key.contains(needle))
@@ -404,6 +471,10 @@ mod tests {
         assert!(looks_like_secret("AWS_SECRET_ACCESS_KEY"));
         assert!(looks_like_secret("SERVICE_PASSWORD"));
         assert!(looks_like_secret("SSH_KEY"));
+        // A credential pasted into a header is as exposed as one in `env`.
+        assert!(looks_like_secret("Authorization"));
+        assert!(looks_like_secret("Cookie"));
+        assert!(!looks_like_secret("x-project-id"));
         assert!(!looks_like_secret("LOG_LEVEL"));
         assert!(!looks_like_secret("PATH"));
         assert!(!looks_like_secret("NODE_OPTIONS"));

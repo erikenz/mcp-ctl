@@ -26,8 +26,21 @@ pub struct McpServer {
     /// Secrets, keyed by the env var name the server expects. See `SecretValue`.
     #[serde(default)]
     pub env: BTreeMap<String, SecretValue>,
+    /// A remote server, spoken to over Streamable HTTP.
     #[serde(default)]
     pub url: Option<String>,
+    /// Headers sent with every request to a remote (`url`) server.
+    ///
+    /// Values are secret sources for the same reason `env` values are: an API key in
+    /// the profile file is one copy-paste away from being shared. An `Authorization`
+    /// header here means "this server takes a fixed credential", which turns OAuth
+    /// off for it.
+    #[serde(default)]
+    pub headers: BTreeMap<String, SecretValue>,
+    /// How to authenticate to a remote server. Absent means "use a stored OAuth
+    /// token, and sign in on demand".
+    #[serde(default)]
+    pub auth: RemoteAuth,
     /// Whether `mcp-ctl up` (without `--all`) serves this server.
     #[serde(default)]
     pub serve: bool,
@@ -56,6 +69,67 @@ pub struct McpServer {
     /// like a shell would.
     #[serde(default)]
     pub cwd: Option<PathBuf>,
+}
+
+/// How to authenticate to a remote (`url`) server.
+///
+/// Absent is `oauth`, which is also the only mode that can start a sign-in when the
+/// server asks for one: the other two are for servers that were configured with a
+/// credential already, or that need none.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum RemoteAuth {
+    /// OAuth 2.1: use a stored token, refresh it, and sign in when there is none.
+    Oauth {
+        /// Scopes to request; the server's own list when omitted.
+        #[serde(default)]
+        scopes: Vec<String>,
+        /// A registered client, for providers without dynamic registration.
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        client_secret: Option<SecretValue>,
+    },
+    /// No authentication: no token is attached and a 401 is reported as-is.
+    None,
+}
+
+impl Default for RemoteAuth {
+    fn default() -> Self {
+        Self::Oauth {
+            scopes: Vec::new(),
+            client_id: None,
+            client_secret: None,
+        }
+    }
+}
+
+impl RemoteAuth {
+    /// The configured scopes, empty when the server's own list should be used.
+    pub fn scopes(&self) -> &[String] {
+        match self {
+            Self::Oauth { scopes, .. } => scopes,
+            Self::None => &[],
+        }
+    }
+
+    pub fn client_id(&self) -> Option<&str> {
+        match self {
+            Self::Oauth { client_id, .. } => client_id.as_deref(),
+            Self::None => None,
+        }
+    }
+
+    pub fn client_secret(&self) -> Option<&SecretValue> {
+        match self {
+            Self::Oauth { client_secret, .. } => client_secret.as_ref(),
+            Self::None => None,
+        }
+    }
+
+    pub fn is_oauth(&self) -> bool {
+        matches!(self, Self::Oauth { .. })
+    }
 }
 
 /// Which of a server's tools are published.
@@ -209,6 +283,11 @@ impl fmt::Debug for SecretSource {
 }
 
 impl McpServer {
+    /// Is this a remote server spoken to over HTTP?
+    pub fn is_remote(&self) -> bool {
+        self.command.is_none() && self.url.is_some()
+    }
+
     /// A one-line description of what this entry points at.
     pub fn command_line(&self) -> String {
         if let Some(command) = &self.command {
@@ -225,9 +304,19 @@ impl McpServer {
         }
     }
 
-    /// Only local stdio servers can be multiplexed by the hub.
+    /// Is this a local server, started as a child process?
     pub fn is_stdio(&self) -> bool {
         self.command.is_some()
+    }
+
+    /// Does the profile supply its own credential for this remote server?
+    ///
+    /// A configured `Authorization` header is an explicit choice, so OAuth is not
+    /// attempted behind it: a stored token would replace the header the user wrote.
+    pub fn has_authorization_header(&self) -> bool {
+        self.headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("authorization"))
     }
 
     /// The tool-call timeout for this server, falling back to the global setting.
@@ -246,6 +335,22 @@ impl McpServer {
 /// the child process only.
 pub fn resolve_env(name: &str, server: &McpServer) -> Result<Vec<(String, String)>> {
     resolve_env_with_timeout(name, server, None)
+}
+
+pub fn resolve_headers_with_timeout(
+    name: &str,
+    server: &McpServer,
+    timeout: Option<Duration>,
+) -> Result<Vec<(String, String)>> {
+    let mut resolved = Vec::with_capacity(server.headers.len());
+    for (key, value) in &server.headers {
+        let from = secret::describe(value);
+        let value = secret::resolve_with_timeout(key, value, timeout).with_context(|| {
+            format!("failed to resolve the {key} header for '{name}' from {from}")
+        })?;
+        resolved.push((key.clone(), value));
+    }
+    Ok(resolved)
 }
 
 /// Resolve every env entry of a server, bounding each external lookup.
@@ -272,8 +377,7 @@ pub fn resolve_env_with_timeout(
 /// Rules:
 ///  * names given on the command line must exist: a typo is an error, not a silent no-op;
 ///  * servers with `"enabled": false` are skipped with a warning;
-///  * remote (`url`) servers are skipped with a warning, because only stdio servers
-///    can be multiplexed — serving them would produce a hub with no tools;
+///  * entries that are neither a `command` nor a `url` are skipped with a warning;
 ///  * without names, `--all` selects every server and the default selects the ones
 ///    marked `"serve": true`.
 pub fn select<'a>(
@@ -316,11 +420,8 @@ pub fn select<'a>(
             errln!("warning: skipping '{name}': \"enabled\" is false");
             continue;
         }
-        if !server.is_stdio() {
-            errln!(
-                "warning: skipping '{name}': only local stdio servers can be served ({})",
-                server.command_line()
-            );
+        if !server.is_stdio() && !server.is_remote() {
+            errln!("warning: skipping '{name}': neither a command nor a url is configured");
             continue;
         }
         selected.push((name, server));
@@ -424,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn select_skips_disabled_and_remote_servers() {
+    fn select_skips_disabled_servers_and_keeps_remote_ones() {
         let mcp = parse(
             r#"{"mcpServers":{
                 "disabled":{"command":"true","enabled":false,"serve":true},
@@ -432,9 +533,16 @@ mod tests {
                 "local":{"command":"true","serve":true}
             }}"#,
         );
-        let selected = select(&mcp, &[], false).expect("the local server is servable");
+        let selected = select(&mcp, &[], false).expect("both servers are servable");
         let names: Vec<&str> = selected.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(names, vec!["local"]);
+        assert_eq!(names, vec!["local", "remote"]);
+    }
+
+    #[test]
+    fn an_entry_with_neither_a_command_nor_a_url_is_not_servable() {
+        let mcp = parse(r#"{"mcpServers":{"empty":{"serve":true}}}"#);
+        let error = select(&mcp, &[], false).unwrap_err().to_string();
+        assert!(error.contains("no servers to serve"), "{error}");
     }
 
     #[test]

@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
+use crate::oauth;
 use crate::platform;
+use crate::remote::RemoteServer;
 use crate::servers::ToolFilter;
 
 /// Revisions mcp-ctl speaks over the `initialize` handshake, newest first.
@@ -740,11 +742,49 @@ impl Registry {
 /// A served backend: the process, plus how many tools it contributed and whether it is
 /// still running, so that `status` never waits for a backend that is busy in a call.
 struct Backend {
-    server: Arc<Mutex<ChildServer>>,
+    server: Arc<Mutex<Served>>,
     tools: usize,
     alive: bool,
-    /// The backend's process id, so it can be stopped even if the lock is busy.
+    /// The backend's process id, so it can be stopped even if the lock is busy. Zero
+    /// for a remote server, which has no process to signal.
     pid: u32,
+}
+
+/// What a backend is: a local process, or a remote endpoint reached over HTTP.
+///
+/// The hub publishes tools and forwards calls the same way for both, so the
+/// difference lives here and nowhere else.
+pub enum Served {
+    Stdio(ChildServer),
+    /// Boxed: a `ChildServer` is much larger than a `RemoteServer`, and every
+    /// backend slot would otherwise be sized for the larger one.
+    Remote(Box<RemoteServer>),
+}
+
+impl Served {
+    fn call_tool(&mut self, params: Value) -> Result<Value> {
+        match self {
+            Self::Stdio(server) => server.call_tool(params),
+            Self::Remote(server) => server.call_tool(params),
+        }
+    }
+
+    fn shutdown(&mut self, grace: Duration) -> Result<()> {
+        match self {
+            Self::Stdio(server) => server.shutdown(grace),
+            Self::Remote(server) => server.shutdown(grace),
+        }
+    }
+
+    /// Why this backend is gone, or `None` while it is still usable.
+    fn exited_status(&mut self) -> Option<String> {
+        match self {
+            Self::Stdio(server) => server.exited_status().map(|status| status.to_string()),
+            // A remote server has no process: it is reachable per request or the
+            // request fails. There is nothing to supervise in the background.
+            Self::Remote(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -767,6 +807,18 @@ pub struct BackendSpec<'a> {
     pub cwd: Option<&'a Path>,
     pub env: &'a [(String, String)],
     pub env_clear: bool,
+    pub prefix: Option<&'a str>,
+    pub filter: Option<&'a ToolFilter>,
+    pub timeouts: BackendTimeouts,
+}
+
+/// Everything needed to connect one remote backend.
+pub struct RemoteSpec<'a> {
+    pub name: &'a str,
+    pub url: &'a str,
+    pub headers: Vec<(String, String)>,
+    /// `None` when the profile supplies its own credential (or opts out of auth).
+    pub oauth: Option<oauth::Client>,
     pub prefix: Option<&'a str>,
     pub filter: Option<&'a ToolFilter>,
     pub timeouts: BackendTimeouts,
@@ -803,7 +855,7 @@ impl Hub {
             registry.backends.insert(
                 spec.name.to_string(),
                 Backend {
-                    server: Arc::new(Mutex::new(server)),
+                    server: Arc::new(Mutex::new(Served::Stdio(server))),
                     tools: published,
                     alive: true,
                     pid,
@@ -812,13 +864,53 @@ impl Hub {
             (published, renamed)
         };
 
-        let prefix_note = match spec.prefix {
+        self.report(spec.name, spec.prefix, available, published, &renamed);
+        Ok(published)
+    }
+
+    /// Connect a remote server and publish the tools that survive its filter.
+    pub fn add_remote(&self, spec: RemoteSpec<'_>) -> Result<usize> {
+        let server =
+            RemoteServer::connect(spec.name, spec.url, spec.headers, spec.oauth, spec.timeouts)?;
+        let available = server.tools().len();
+        let definitions = server.tools().to_vec();
+
+        let (published, renamed) = {
+            let mut registry = write_lock(&self.registry);
+            let (published, renamed) =
+                registry.publish(spec.name, spec.prefix, spec.filter, &definitions);
+            registry.backends.insert(
+                spec.name.to_string(),
+                Backend {
+                    server: Arc::new(Mutex::new(Served::Remote(Box::new(server)))),
+                    tools: published,
+                    alive: true,
+                    // No process to signal; shutdown goes through the session instead.
+                    pid: 0,
+                },
+            );
+            (published, renamed)
+        };
+
+        self.report(spec.name, spec.prefix, available, published, &renamed);
+        Ok(published)
+    }
+
+    fn report(
+        &self,
+        name: &str,
+        prefix: Option<&str>,
+        available: usize,
+        published: usize,
+        renamed: &[String],
+    ) {
+        let prefix_note = match prefix {
             Some(prefix) => format!(" [prefix: {prefix}_]"),
             None => String::new(),
         };
         outln!(
             "  ✓ '{}' connected ({published} tool{}){prefix_note}",
-            spec.name,
+            name,
             if published == 1 { "" } else { "s" }
         );
         let hidden = available.saturating_sub(published);
@@ -829,8 +921,6 @@ impl Hub {
             // Users deserve to know why `search` came back as `github_search`.
             outln!("    exposed as: {}", renamed.join(", "));
         }
-
-        Ok(published)
     }
 
     /// Dispatch one JSON-RPC message.
@@ -1002,6 +1092,11 @@ impl Hub {
                 }
                 Err(_) => {
                     errln!("warning: '{name}' is still busy; terminating its process group");
+                    if backend.pid == 0 {
+                        // A remote backend has no group to terminate; dropping the
+                        // connection is all there is.
+                        continue;
+                    }
                     if let Err(error) = platform::terminate_group(backend.pid) {
                         errln!("warning: failed to stop '{name}': {error}");
                     }

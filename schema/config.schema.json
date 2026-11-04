@@ -240,7 +240,46 @@
         },
         "url": {
           "type": "string",
-          "description": "For a remote MCP server. mcp-ctl lists these but cannot serve them yet."
+          "description": "A remote MCP server over Streamable HTTP. mcp-ctl serves it and signs in with OAuth 2.1 when the server asks for it."
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/secret"
+          },
+          "description": "Headers sent with every request to a remote server, keyed by header name. An Authorization header here is used as-is and turns OAuth off for that server."
+        },
+        "auth": {
+          "type": "object",
+          "description": "How to authenticate to a remote server. Omitted means OAuth: a stored token is used, refreshed, and a sign-in is needed when there is none.",
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["type"],
+              "properties": {
+                "type": { "const": "oauth" },
+                "scopes": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "Scopes to request. Defaults to the server's own list."
+                },
+                "client_id": {
+                  "type": "string",
+                  "description": "A registered client id, for providers without dynamic client registration."
+                },
+                "client_secret": { "$ref": "#/$defs/secret" }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["type"],
+              "properties": {
+                "type": { "const": "none" }
+              }
+            }
+          ]
         },
         "serve": {
           "type": "boolean",

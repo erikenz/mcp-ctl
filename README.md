@@ -3,7 +3,7 @@
 [![CI](https://github.com/erikenz/mcp-ctl/actions/workflows/ci.yml/badge.svg)](https://github.com/erikenz/mcp-ctl/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-One config file for all your MCP servers. `mcp-ctl` fills in secrets from your password manager, runs a single server on stdio for a local editor, or serves everything you choose over one authenticated HTTP endpoint for remote agents.
+One config file for all your MCP servers. `mcp-ctl` fills in secrets from your password manager, signs in to remote servers that want OAuth, runs a single server on stdio for a local editor, or serves everything you choose over one authenticated HTTP endpoint for remote agents.
 
 ## Requirements
 
@@ -81,6 +81,8 @@ mcp-ctl up       # serve the servers marked "serve": true
 mcp-ctl list              # what is configured
 mcp-ctl check             # validate config, resolve secrets, flag busy ports
 mcp-ctl run <name>        # run one server on stdio, for a local editor
+mcp-ctl auth login <name> # sign in to a remote server that wants OAuth
+mcp-ctl auth status       # which remote servers have a usable token
 mcp-ctl up                # serve over HTTP; add -d for the background daemon
 mcp-ctl status            # what the service is doing (--json for scripts)
 mcp-ctl logs -f           # follow the daemon log
@@ -99,7 +101,9 @@ mcp-ctl update            # update in place, when the install script owns the bi
 | Key | Default | Meaning |
 | :--- | :--- | :--- |
 | `command` / `args` / `env` | — | A local stdio server. An `env` value may be a secret source, or a plain string for a non-secret setting. |
-| `url` | — | A remote MCP server. Listed by `list`, not served yet. |
+| `url` | — | A remote MCP server over Streamable HTTP. Served like a local one; OAuth is used when the server asks for it. |
+| `headers` | — | Headers for a remote server, keyed by name. Values are secret sources. An `Authorization` header is used as given and turns OAuth off for that server. |
+| `auth` | OAuth | `{"type": "oauth", "scopes": [...], "client_id": ..., "client_secret": ...}` or `{"type": "none"}`. |
 | `serve` | `false` | Whether `mcp-ctl up` serves this server without it being named on the command line. |
 | `enabled` | `true` | Set to `false` to keep an entry but ignore it everywhere. |
 | `prefix` | — | Prefix this server's tool names, e.g. `github_create_issue`. |
@@ -109,6 +113,78 @@ mcp-ctl update            # update in place, when the install script owns the bi
 | `cwd` | — | Working directory for a stdio server. |
 
 Keys mcp-ctl does not know are ignored inside a server entry, because the same file is also read by other MCP clients, so a snippet copied from a server's README works as it is. Top-level keys are strict, so `"proxy_portt"` is reported instead of silently ignored.
+
+### Remote servers
+
+An entry with a `url` is served over Streamable HTTP, exactly like a local one: its
+tools appear on the same endpoint, with the same prefixes and filters. There is nothing
+provider-specific about it, and `mcp-ctl` has no allowlist of servers: anything that
+speaks MCP over Streamable HTTP works.
+
+```json
+"some-remote-server": { "url": "https://mcp.example.com/mcp", "serve": true }
+```
+
+**Signing in is local.** When a remote server answers `401`, it advertises where to
+authenticate. `mcp-ctl auth login <name>` follows that chain (Protected Resource
+Metadata, then the authorization server's metadata), registers a client with dynamic
+client registration, and runs the authorization code flow with PKCE and the `resource`
+parameter. The redirect URI is a loopback listener on `127.0.0.1`, so nothing about
+your machine, profile or hub has to be reachable from the internet. Tokens land in the
+state directory, owner-only; `auth status` shows what is stored, `auth logout` forgets
+it.
+
+```bash
+mcp-ctl auth login some-remote-server   # opens a browser, waits for the callback
+mcp-ctl auth status
+```
+
+A refresh token is used automatically before an expired access token, and once more
+after a `401`.
+
+`auth.scopes` and `--scopes` are optional and provider-neutral: they are sent as the
+OAuth `scope` parameter, so the names are whatever that server publishes, not something
+mcp-ctl defines. With neither, no scope is requested and the server decides.
+
+```json
+"some-remote-server": {
+  "url": "https://mcp.example.com/mcp",
+  "auth": { "type": "oauth", "scopes": ["read:things"] }
+}
+```
+
+**A server that only takes an API key needs no sign-in.** Give it a `headers` entry
+whose value comes from a vault or `.env` — a literal key in the profile file is refused
+for `auth` and warned about here, for the same reason. The value is sent verbatim, so
+it keeps the scheme the server documents:
+
+```json
+"some-keyed-server": {
+  "url": "https://mcp.example.com/mcp",
+  "headers": { "Authorization": { "source": "env", "name": "EXAMPLE_AUTH_HEADER" } }
+}
+```
+
+```bash
+# .env, next to the profile file
+EXAMPLE_AUTH_HEADER=Bearer your-api-key
+```
+
+Scopes are the **server's** limit, not a local filter: `mcp-ctl` publishes every tool
+the server lists, whether or not the granted token could actually use it. A read-only
+consent is only as strong as the provider's enforcement — one provider tested here
+lists write tools and accepts a write call with a read-only token. To bind the agent
+locally, filter the tools:
+
+```json
+"some-remote-server": {
+  "url": "https://mcp.example.com/mcp",
+  "tools": { "exclude": ["create_*", "delete_*", "update_*"] }
+}
+```
+
+Remote servers also work on stdio: `mcp-ctl run some-remote-server` bridges one to
+stdin/stdout, for editors that do not speak HTTP.
 
 ### Settings
 
@@ -238,7 +314,9 @@ Editors that speak MCP over stdio can run one server through `mcp-ctl run`:
 { "command": "mcp-ctl", "args": ["run", "github"] }
 ```
 
-or take the whole hub through [`mcp-remote`](https://www.npmjs.com/package/mcp-remote):
+`mcp-ctl run <name>` works for a remote server too: it bridges the HTTP endpoint to
+stdio, with the same OAuth token the hub uses. Or take the whole hub through
+[`mcp-remote`](https://www.npmjs.com/package/mcp-remote):
 
 ```json
 { "command": "npx", "args": ["-y", "mcp-remote", "http://127.0.0.1:37373/mcp"] }
@@ -285,6 +363,7 @@ With `"tray": { "enabled": true }` an icon appears while `mcp-ctl up` runs: a li
 
 - The hub binds loopback and has no authentication of its own. `auth.bearer_token` is the only thing that authenticates the hub port; the auth proxy protects the tunnel in front of it, not the hub. A non-loopback bind with proxy-only auth, or a tunnel aimed at the hub, is refused.
 - Browser requests are checked against their `Origin`. The `Host` header is not trusted, so a hostname that resolves to `127.0.0.1` cannot call your tools. The port is not compared, but the public URL's scheme is enforced at every port.
+- Remote sign-in tokens live in `oauth.json` in the state directory, owner-only, and are redacted in `Debug` output. They are the same bearer credentials your browser holds, so treat that file as you would a password.
 - Secrets are resolved when a server starts and handed to that child. They are redacted in `Debug` output and never logged; the auth proxy receives them through the environment rather than the command line. A backend also inherits the daemon's environment unless `env_clear` is set, so prefer `.env` for a value only one server should see.
 - Only `auth` literals are refused in the profile file. A plain string in a server's `env` is for non-secret settings; a secret placed in `args` is part of the command line and is shown by `list`/`check`. Use `.env`, the environment or a vault.
 - `.env` is checked for owner-only permissions on Unix, and the state directory, log and files `init` writes are owner-only.
@@ -299,10 +378,13 @@ Linux, macOS and Windows build and test in CI. Linux is the reference platform; 
 
 ## Limitations
 
-- Only local stdio servers are served. Entries with `url` are listed and skipped.
 - Tools are exposed; resources and prompts are not.
 - `POST /mcp` is the only method on the endpoint: no sessions, no server-sent stream.
 - Tool-call progress notifications are not relayed yet.
+- A granted OAuth scope is not enforced by `mcp-ctl`: every tool the server lists is published. Whether a write really happens is the provider's decision. Use `tools.exclude` to cap what the agent can call.
+- OAuth sign-in needs a browser on the same machine as `mcp-ctl`, because the callback is a loopback listener. Device flow is not implemented yet, so a headless box signs in with a `headers` credential instead.
+- Servers that require a client ID metadata document and offer no dynamic registration cannot be used yet; register a client yourself and set `auth.client_id` (and `client_secret`).
+- The daemon and a `mcp-ctl auth` command share the token store without a lock. Each replaces it atomically and re-reads it just before writing, but running both at the same instant can still lose one update.
 
 ## Contributing
 
@@ -316,7 +398,7 @@ cargo test --all-features --locked
 
 ## Acknowledgements
 
-mcp-ctl was inspired by [mcp-hub](https://github.com/ravitemer/mcp-hub) — the single endpoint in front of many servers, and the default port 37373, come from there. Remote authentication runs on [`mcp-auth-proxy`](https://github.com/sigbit/mcp-auth-proxy), which mcp-ctl supervises rather than reimplements.
+mcp-ctl was inspired by [mcp-hub](https://github.com/ravitemer/mcp-hub) — the single endpoint in front of many servers, and the default port 37373, come from there. Sign-in for your own clients runs on [`mcp-auth-proxy`](https://github.com/sigbit/mcp-auth-proxy), which mcp-ctl supervises rather than reimplements. Signing in *to* remote servers is mcp-ctl's own OAuth 2.1 client (`src/oauth.rs`), so a remote server never needs a public callback URL.
 
 ## License
 

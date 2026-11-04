@@ -357,6 +357,27 @@ impl ToolConfig {
                     "mcpServers.{name}.timeout_secs must be at most {MAX_TIMEOUT_SECS}s; 0 disables the timeout"
                 );
             }
+
+            // The same rule as `auth.client_secret` at the top level: a credential in
+            // this file is one copy-paste away from being shared or committed.
+            if server.auth.client_secret().is_some_and(is_literal) {
+                bail!(
+                    "mcpServers.{name}.auth.client_secret must not be a literal value in the \
+                     profile file. Put the value in .env next to it and use \
+                     {{\"source\": \"env\", \"name\": \"...\"}}, or read it from a vault."
+                );
+            }
+
+            for header in server.headers.keys() {
+                validate_header_name(header)
+                    .with_context(|| format!("mcpServers.{name}.headers"))?;
+            }
+
+            // A remote server's URL is validated here rather than at connect time, so
+            // a typo is reported by `list` and `check` instead of at startup.
+            if let Some(url) = &server.url {
+                crate::oauth::Url::parse(url).with_context(|| format!("mcpServers.{name}.url"))?;
+            }
         }
 
         if let Some(auth) = &self.auth {
@@ -409,6 +430,40 @@ pub fn mcp_endpoint_url(external_url: &str) -> String {
     } else {
         format!("{trimmed}/mcp")
     }
+}
+
+/// A header name has to survive the wire: RFC 7230 allows a token and nothing else,
+/// so a name with a space or a colon in it is a configuration mistake, not a header.
+fn validate_header_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("a header name must not be empty");
+    }
+    if !name.bytes().all(is_token_byte) {
+        bail!("'{name}' is not a valid header name: use letters, digits and !#$%&'*+-.^_`|~ only");
+    }
+    Ok(())
+}
+
+/// The `tchar` set from RFC 7230 §3.2.6.
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 pub(crate) fn validate_external_url(url: &str) -> Result<()> {
@@ -753,6 +808,76 @@ mod tests {
         .unwrap();
         let error = cfg.validate().unwrap_err().to_string();
         assert!(error.contains("bearer_token"), "{error}");
+    }
+
+    #[test]
+    fn a_server_client_secret_must_come_from_a_source_too() {
+        let literal: ToolConfig = serde_json::from_str(
+            r#"{"mcpServers": {"remote": {
+                "url": "https://example.test/mcp",
+                "auth": {"type": "oauth", "client_id": "abc", "client_secret": "hunter2"}
+            }}}"#,
+        )
+        .unwrap();
+        let error = literal.validate().unwrap_err().to_string();
+        assert!(error.contains("client_secret"), "{error}");
+        assert!(
+            !error.contains("hunter2"),
+            "the value must not be echoed: {error}"
+        );
+
+        let sourced: ToolConfig = serde_json::from_str(
+            r#"{"mcpServers": {"remote": {
+                "url": "https://example.test/mcp",
+                "auth": {"type": "oauth", "client_id": "abc",
+                         "client_secret": {"source": "env", "name": "CLIENT_SECRET"}}
+            }}}"#,
+        )
+        .unwrap();
+        sourced
+            .validate()
+            .expect("a sourced client secret is valid");
+    }
+
+    #[test]
+    fn a_remote_url_is_checked_before_it_is_ever_called() {
+        for bad in [
+            "example.test/mcp",
+            "ftp://example.test/mcp",
+            "https://example.test/a b",
+        ] {
+            let cfg: ToolConfig =
+                serde_json::from_str(&format!(r#"{{"mcpServers": {{"r": {{"url": "{bad}"}}}}}}"#))
+                    .unwrap();
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains("mcpServers.r.url"), "{bad}: {error}");
+        }
+
+        let good: ToolConfig = serde_json::from_str(
+            r#"{"mcpServers": {"r": {"url": "https://example.test/mcp?readonly=true"}}}"#,
+        )
+        .unwrap();
+        good.validate().expect("a plain https url is valid");
+    }
+
+    #[test]
+    fn a_header_name_has_to_be_a_valid_token() {
+        assert!(validate_header_name("Authorization").is_ok());
+        assert!(validate_header_name("x-project-id").is_ok());
+        assert!(validate_header_name("X_Custom.Thing~1").is_ok());
+        for bad in ["", "Auth orization", "Auth:orization", "x\r\nInjected"] {
+            assert!(validate_header_name(bad).is_err(), "{bad}");
+        }
+
+        let cfg: ToolConfig = serde_json::from_str(
+            r#"{"mcpServers": {"r": {
+                "url": "https://example.test/mcp",
+                "headers": {"Bad Header": "x"}
+            }}}"#,
+        )
+        .unwrap();
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("mcpServers.r.headers"), "{error}");
     }
 
     #[test]

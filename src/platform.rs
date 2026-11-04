@@ -380,6 +380,35 @@ fn restrict_to_owner_impl(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Open a URL in the user's browser.
+///
+/// The only platform-specific piece of the OAuth flow; everything else is HTTP. A
+/// failure is not fatal: the caller has already printed the URL, so the user can
+/// copy it.
+pub fn open_url(url: &str) -> Result<()> {
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = Command::new("open");
+        command.arg(url);
+        command
+    } else if cfg!(windows) {
+        let mut command = Command::new("cmd");
+        command.args(["/c", "start", ""]).arg(url);
+        command
+    } else {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!("could not open a browser for {url}: {error}"))
+}
+
 /// Hand this process over to an MCP server, returning its exit code.
 ///
 /// On Unix the process is *replaced*: stdio, signals and the exit status belong to

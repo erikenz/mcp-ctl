@@ -80,7 +80,7 @@ fn list_reports_commands_and_flags() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("alpha [serve]: true --flag"), "{stdout}");
     assert!(
-        stdout.contains("beta [remote]: remote https://example.test/mcp"),
+        stdout.contains("beta [remote, oauth]: remote https://example.test/mcp"),
         "{stdout}"
     );
     assert!(stdout.contains("gamma [disabled, prefix: g]"), "{stdout}");
@@ -104,7 +104,7 @@ fn unusable_server_definitions_are_reported_by_run() {
     sandbox.mcp_json(
         r#"{"mcpServers":{
             "gone":{"command":"true","enabled":false},
-            "remote":{"url":"https://example.test/mcp"}
+            "remote":{"url":"http://127.0.0.1:1/mcp"}
         }}"#,
     );
 
@@ -112,13 +112,39 @@ fn unusable_server_definitions_are_reported_by_run() {
     assert!(!disabled.status.success());
     assert!(String::from_utf8_lossy(&disabled.stderr).contains("disabled"));
 
+    // A remote entry is bridged to stdio now; this one has nothing listening, so the
+    // bridge must fail with the transport error rather than pretend to work.
     let remote = sandbox.run(&["run", "remote"]);
     assert!(!remote.status.success());
-    assert!(String::from_utf8_lossy(&remote.stderr).contains("not a local stdio server"));
+    assert!(
+        String::from_utf8_lossy(&remote.stderr).contains("could not reach server"),
+        "{}",
+        String::from_utf8_lossy(&remote.stderr)
+    );
 
     let missing = sandbox.run(&["run", "nope"]);
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("unknown server"));
+}
+
+#[test]
+fn check_warns_about_a_credential_pasted_into_a_header() {
+    let sandbox = Sandbox::new("cli-check-header");
+    sandbox.mcp_json(
+        r#"{"mcpServers":{
+            "keyed":{"url":"https://example.test/mcp",
+                     "headers":{"Authorization":"Bearer phx_pasted_key"}}
+        }}"#,
+    );
+
+    let output = sandbox.run(&["check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Authorization header looks like a secret"),
+        "{stdout}"
+    );
+    // The value itself is never printed, only where it came from.
+    assert!(!stdout.contains("phx_pasted_key"), "{stdout}");
 }
 
 #[test]

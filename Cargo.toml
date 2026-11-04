@@ -75,6 +75,11 @@ name = "mcp-fake-auth-proxy"
 path = "tests/support/fake_auth_proxy.rs"
 required-features = ["test-support"]
 
+[[bin]]
+name = "mcp-fake-oauth-server"
+path = "tests/support/fake_oauth_server.rs"
+required-features = ["test-support"]
+
 [profile.release]
 lto = true
 codegen-units = 1

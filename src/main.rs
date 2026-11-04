@@ -8,8 +8,10 @@ mod daemon;
 mod exposure;
 mod http;
 mod hub;
+mod oauth;
 mod orchestrator;
 mod platform;
+mod remote;
 mod secret;
 mod servers;
 mod tray;
@@ -55,10 +57,16 @@ enum Commands {
     List,
     /// Write the default profile file and .env (never overwrites)
     Init,
-    /// Run one server on stdio, resolving its secrets first
+    /// Run one server on stdio, resolving its secrets first. A remote server is
+    /// bridged to stdio, so editors that only speak stdio can use it.
     Run {
         /// Name of the server in the profile file
         name: String,
+    },
+    /// Sign in to remote servers, inspect their tokens, and forget them
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
     },
     /// Serve servers over HTTP: local hub, optional auth proxy, optional tunnel
     Up {
@@ -104,6 +112,39 @@ enum Commands {
         /// Machine-readable output, for scripts and menu-bar wrappers
         #[arg(long)]
         json: bool,
+    },
+}
+
+/// What `mcp-ctl auth` can do.
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Sign in to a remote server through the browser
+    Login {
+        /// Name of the server in the profile file
+        name: String,
+
+        /// Print the URL instead of opening a browser
+        #[arg(long)]
+        no_open: bool,
+
+        /// Seconds to wait for the browser to come back
+        #[arg(long, value_name = "SECONDS", default_value_t = oauth::DEFAULT_LOGIN_TIMEOUT.as_secs())]
+        timeout: u64,
+
+        /// Scopes to request, comma-separated; defaults to the profile's `auth.scopes`
+        #[arg(long, value_delimiter = ',', value_name = "SCOPE")]
+        scopes: Vec<String>,
+    },
+    /// Show which remote servers have a usable token
+    Status {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Forget a server's tokens (the client registration is kept)
+    Logout {
+        /// Name of the server in the profile file
+        name: String,
     },
 }
 
@@ -227,10 +268,19 @@ fn run() -> Result<u8> {
             );
         }
         Commands::Run { name } => {
+            let server = tool_config.mcp_servers.get(&name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown server '{name}' (`mcp-ctl list` shows the configured ones)"
+                )
+            })?;
+            if server.is_remote() {
+                return Ok(run_remote(&paths, &tool_config, &name, server)? as u8);
+            }
             // On Unix this never returns: the server replaces this process.
             let code = servers::run(&name, &tool_config.mcp_servers)?;
             return Ok(code.rem_euclid(256) as u8);
         }
+        Commands::Auth { action } => return auth(&paths, &tool_config, action),
         Commands::Up { serve, detach } => {
             let options = serve.into_options(cli.verbose, cli.verbose_bodies, &paths)?;
             if detach {
@@ -368,7 +418,16 @@ fn list(paths: &Paths, tool_config: &ToolConfig) -> Result<()> {
             flags.push("disabled".to_string());
         }
         if !server.is_stdio() {
-            flags.push("remote".to_string());
+            if server.is_remote() {
+                flags.push(match &server.auth {
+                    servers::RemoteAuth::Oauth { .. } if !server.has_authorization_header() => {
+                        "remote, oauth".to_string()
+                    }
+                    _ => "remote".to_string(),
+                });
+            } else {
+                flags.push("remote".to_string());
+            }
         }
         if let Some(prefix) = &server.prefix {
             flags.push(format!("prefix: {prefix}"));
@@ -387,4 +446,154 @@ fn list(paths: &Paths, tool_config: &ToolConfig) -> Result<()> {
         outln!("{name}{flags}: {}", server.command_line());
     }
     Ok(())
+}
+
+/// Serve a remote server on stdio, so an editor that only speaks stdio can use it.
+///
+/// The transport is the same one the hub uses, including the OAuth token; the bridge
+/// only exists because `mcp-ctl run` promises stdio on its own stdin and stdout.
+fn run_remote(
+    paths: &Paths,
+    tool_config: &ToolConfig,
+    name: &str,
+    server: &servers::McpServer,
+) -> Result<i32> {
+    if !server.enabled {
+        anyhow::bail!("server '{name}' is disabled (\"enabled\": false in config.json)");
+    }
+    let url = server
+        .url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("server '{name}' has no url"))?;
+    let server_config = tool_config.server();
+    let headers =
+        servers::resolve_headers_with_timeout(name, server, server_config.secret_timeout())?;
+    let oauth = orchestrator::oauth_client(paths, name, server)?;
+    let timeouts = hub::BackendTimeouts {
+        handshake: hub::BackendTimeouts::DEFAULT_HANDSHAKE,
+        tool: server.tool_timeout(server_config.tool_timeout()),
+    };
+    let remote = remote::RemoteServer::connect(name, url, headers, oauth, timeouts)?;
+    remote::bridge(remote)
+}
+
+/// `mcp-ctl auth ...`.
+fn auth(paths: &Paths, tool_config: &ToolConfig, action: AuthAction) -> Result<u8> {
+    match action {
+        AuthAction::Login {
+            name,
+            no_open,
+            timeout,
+            scopes: requested,
+        } => {
+            let server = remote_server(tool_config, &name)?;
+            if server.has_authorization_header() {
+                anyhow::bail!(
+                    "'{name}' already has an Authorization header in the profile; OAuth is not \
+                     used for it. Remove that header to sign in instead."
+                );
+            }
+            if !server.auth.is_oauth() {
+                anyhow::bail!(
+                    "'{name}' is configured with \"auth\": {{\"type\": \"none\"}}; remove it to \
+                     sign in"
+                );
+            }
+            let url = server
+                .url
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("server '{name}' has no url"))?;
+            let server_config = tool_config.server();
+            let client_secret = match server.auth.client_secret() {
+                Some(value) => Some(
+                    secret::resolve_with_timeout(
+                        "auth.client_secret",
+                        value,
+                        server_config.secret_timeout(),
+                    )
+                    .context("failed to resolve auth.client_secret")?,
+                ),
+                None => None,
+            };
+            let scopes = if requested.is_empty() {
+                server.auth.scopes().to_vec()
+            } else {
+                requested.clone()
+            };
+            oauth::login(
+                paths,
+                &oauth::LoginRequest {
+                    name: &name,
+                    url,
+                    scopes: &scopes,
+                    client_id: server.auth.client_id(),
+                    client_secret,
+                    open_browser: !no_open,
+                    timeout: std::time::Duration::from_secs(timeout.max(1)),
+                },
+            )?;
+            Ok(0)
+        }
+        AuthAction::Status { json } => {
+            let mut rows = Vec::new();
+            let mut remote_servers = 0usize;
+            for (name, server) in &tool_config.mcp_servers {
+                if !server.is_remote() {
+                    continue;
+                }
+                remote_servers += 1;
+                let Some(url) = server.url.as_deref() else {
+                    continue;
+                };
+                let client = oauth::Client::new(paths, name, url)?;
+                let status = client.status()?;
+                if json {
+                    rows.push(serde_json::json!({
+                        "name": name,
+                        "url": url,
+                        "signed_in": status.is_some() && !status.as_ref().unwrap().expired(),
+                        "status": status.as_ref().map(oauth::Status::describe),
+                    }));
+                } else {
+                    match status {
+                        Some(status) => outln!("{name}: {}", status.describe()),
+                        None => outln!("{name}: no token (run `mcp-ctl auth login {name}`)"),
+                    }
+                }
+            }
+            if json {
+                outln!("{}", serde_json::json!(rows));
+            } else if remote_servers == 0 {
+                outln!("No remote servers configured.");
+            }
+            Ok(0)
+        }
+        AuthAction::Logout { name } => {
+            let server = remote_server(tool_config, &name)?;
+            let url = server
+                .url
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("server '{name}' has no url"))?;
+            if oauth::logout(paths, url)? {
+                outln!("✓ forgot the token for '{name}'");
+            } else {
+                outln!("'{name}' had no stored token");
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn remote_server<'a>(tool_config: &'a ToolConfig, name: &str) -> Result<&'a servers::McpServer> {
+    let server = tool_config.mcp_servers.get(name).ok_or_else(|| {
+        anyhow::anyhow!("unknown server '{name}' (`mcp-ctl list` shows the configured ones)")
+    })?;
+    if !server.is_remote() {
+        anyhow::bail!(
+            "'{name}' is not a remote server ({}); \n\
+             `mcp-ctl auth` only signs in to entries with a \"url\"",
+            server.command_line()
+        );
+    }
+    Ok(server)
 }

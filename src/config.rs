@@ -16,10 +16,12 @@ pub const DEFAULT_CONFIG_JSON: &str = r#"{
     "server": {
         "bind": "127.0.0.1",
         "listen_port": 37373,
-        "proxy_port": 8080,
         "tool_timeout_secs": 300,
         "secret_timeout_secs": 30,
         "allowed_origins": []
+    },
+    "proxy": {
+        "port": 8080
     },
     "tunnel": {
         "provider": "none"
@@ -28,7 +30,7 @@ pub const DEFAULT_CONFIG_JSON: &str = r#"{
         "filesystem": {
             "command": "npx",
             "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
-            "serve": false
+            "autostart": false
         },
         "github": {
             "command": "docker",
@@ -69,9 +71,12 @@ pub struct ToolConfig {
     /// The servers this profile manages.
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: BTreeMap<String, McpServer>,
-    /// Server settings for hub and proxy ports.
+    /// Server settings for hub bind address, port and timeouts.
     #[serde(default)]
     pub server: Option<ServerConfig>,
+    /// Proxy settings for the `mcp-auth-proxy` gateway.
+    #[serde(default)]
+    pub proxy: Option<ProxyConfig>,
     /// Authentication settings for remote connections (Delta, etc.).
     #[serde(default)]
     pub auth: Option<AuthConfig>,
@@ -83,6 +88,58 @@ pub struct ToolConfig {
     pub tray: Option<TrayConfig>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyConfig {
+    /// Whether `mcp-auth-proxy` is enabled.
+    ///
+    /// When unset (default `None`), the proxy is automatically started if any proxy
+    /// credentials (`password`, `github_*`, `google_*`) are configured in `auth`.
+    /// Set to `false` to disable the auth proxy even if credentials exist,
+    /// or `true` to require it.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Port mcp-auth-proxy listens on (default: 8080).
+    #[serde(default, alias = "proxy_port")]
+    pub port: Option<u16>,
+    /// Optional path to the `mcp-auth-proxy` executable.
+    #[serde(default, alias = "auth_proxy_path")]
+    pub path: Option<PathBuf>,
+    /// Public URL clients use, for OAuth callbacks and browser origins.
+    #[serde(default)]
+    pub external_url: Option<String>,
+}
+
+impl ProxyConfig {
+    /// Port mcp-auth-proxy listens on, falling back to legacy `server.proxy_port`
+    /// or the default port 8080.
+    pub fn port(&self, server: &ServerConfig) -> u16 {
+        self.port
+            .or(server.proxy_port)
+            .unwrap_or_else(default_proxy_port)
+    }
+
+    /// Path to the `mcp-auth-proxy` executable, falling back to legacy `server.auth_proxy_path`.
+    pub fn path<'a>(&'a self, server: &'a ServerConfig) -> Option<&'a Path> {
+        self.path.as_deref().or(server.auth_proxy_path.as_deref())
+    }
+
+    /// Whether the auth proxy should run.
+    ///
+    /// An explicit `enabled` setting takes precedence; otherwise defaults to
+    /// whether any proxy credentials (password, GitHub, Google OAuth) are configured.
+    pub fn is_enabled(&self, auth: &AuthConfig) -> bool {
+        self.enabled.unwrap_or_else(|| auth.proxy_enabled())
+    }
+
+    /// `external_url` without a trailing slash, ready to be joined with `/mcp`.
+    pub fn external_url(&self) -> Option<String> {
+        self.external_url
+            .as_ref()
+            .map(|url| url.trim_end_matches('/').to_string())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -92,11 +149,12 @@ pub struct ServerConfig {
     pub bind: IpAddr,
     #[serde(default = "default_hub_port")]
     pub listen_port: u16,
-    #[serde(default = "default_proxy_port")]
-    pub proxy_port: u16,
+    /// Deprecated synonym for `proxy.port`.
+    #[serde(default)]
+    pub proxy_port: Option<u16>,
     #[serde(default)]
     pub external_url: Option<String>,
-    /// Optional path to the `mcp-auth-proxy` executable.
+    /// Deprecated synonym for `proxy.path`.
     #[serde(default)]
     pub auth_proxy_path: Option<PathBuf>,
     /// Timeout for a single backend tool call, in seconds. 0 disables the timeout.
@@ -116,7 +174,7 @@ impl Default for ServerConfig {
         Self {
             bind: default_bind(),
             listen_port: default_hub_port(),
-            proxy_port: default_proxy_port(),
+            proxy_port: None,
             external_url: None,
             auth_proxy_path: None,
             tool_timeout_secs: default_tool_timeout_secs(),
@@ -307,6 +365,10 @@ impl ToolConfig {
         self.server.clone().unwrap_or_default()
     }
 
+    pub fn proxy(&self) -> ProxyConfig {
+        self.proxy.clone().unwrap_or_default()
+    }
+
     pub fn auth(&self) -> AuthConfig {
         self.auth.clone().unwrap_or_default()
     }
@@ -319,15 +381,28 @@ impl ToolConfig {
         self.tray.clone().unwrap_or_default()
     }
 
+    /// Resolved public URL from `proxy.external_url` or `server.external_url`.
+    pub fn external_url(&self) -> Option<String> {
+        self.proxy
+            .as_ref()
+            .and_then(|p| p.external_url())
+            .or_else(|| self.server.as_ref().and_then(|s| s.external_url()))
+    }
+
     /// Report configuration mistakes at startup instead of at the first request.
     pub fn validate(&self) -> Result<()> {
+        let server = self.server();
+        let proxy = self.proxy();
+
+        let proxy_port = proxy.port(&server);
+        if proxy_port == server.listen_port {
+            bail!(
+                "server.listen_port and proxy port must differ (both are {})",
+                server.listen_port
+            );
+        }
+
         if let Some(server) = &self.server {
-            if server.proxy_port == server.listen_port {
-                bail!(
-                    "server.listen_port and server.proxy_port must differ (both are {})",
-                    server.listen_port
-                );
-            }
             if let Some(url) = &server.external_url {
                 validate_external_url(url)?;
             }
@@ -346,6 +421,10 @@ impl ToolConfig {
             for origin in &server.allowed_origins {
                 validate_origin(origin)?;
             }
+        }
+
+        if let Some(url) = &proxy.external_url {
+            validate_external_url(url)?;
         }
 
         for (name, server) in &self.mcp_servers {
@@ -401,7 +480,7 @@ impl ToolConfig {
             if auth.google_client_id.is_some() != auth.google_client_secret.is_some() {
                 bail!("auth.google_client_id and auth.google_client_secret must be set together");
             }
-            if auth.bearer_token.is_some() && auth.proxy_enabled() {
+            if auth.bearer_token.is_some() && proxy.is_enabled(auth) {
                 bail!(
                     "auth.bearer_token cannot be combined with auth.password or the OAuth \
                      settings: the hub would require a bearer token the auth proxy does not add. \
@@ -981,7 +1060,7 @@ mod tests {
             }"#,
         );
         assert_eq!(cfg.mcp_servers.len(), 1);
-        assert!(cfg.mcp_servers["github"].serve);
+        assert!(cfg.mcp_servers["github"].autostart());
         assert_eq!(cfg.server().listen_port, 37373);
     }
 

@@ -78,7 +78,10 @@ fn list_reports_commands_and_flags() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("alpha [serve]: true --flag"), "{stdout}");
+    assert!(
+        stdout.contains("alpha [autostart]: true --flag"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("beta [remote, oauth]: remote https://example.test/mcp"),
         "{stdout}"
@@ -501,6 +504,81 @@ fn a_stale_state_file_is_cleaned_up() {
     assert!(
         !state_dir.join("daemon.json").exists(),
         "a state file that nobody answers for should be removed"
+    );
+}
+
+#[test]
+fn check_warns_when_serve_key_is_used() {
+    let sandbox = Sandbox::new("cli-check-deprecated-serve");
+    sandbox.mcp_json(r#"{"mcpServers":{"legacy":{"command":"true","serve":true},"modern":{"command":"true","autostart":true}}}"#);
+    sandbox.config_json(r#"{ "server": { "listen_port": 0 } }"#);
+
+    let output = sandbox.run(&["check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("legacy: \"serve\" is deprecated; use \"autostart\" instead"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("modern: \"serve\" is deprecated"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn check_accepts_proxy_section_and_toggles_with_enabled() {
+    let sandbox = Sandbox::new("cli-check-proxy-section");
+    sandbox.mcp_json(r#"{"mcpServers":{}}"#);
+    sandbox.config_json(
+        r#"{
+            "server": { "listen_port": 0 },
+            "proxy": { "enabled": false },
+            "auth": { "password": { "source": "env", "name": "MCP_CTL_TEST_PASSWORD" } }
+        }"#,
+    );
+    sandbox.env_file("MCP_CTL_TEST_PASSWORD=hunter2\n");
+
+    let output = sandbox.run(&["check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("disabled by proxy.enabled = false"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("external_url"),
+        "external_url should not be required when proxy is disabled: {stdout}"
+    );
+}
+
+#[test]
+fn check_warns_when_legacy_server_proxy_keys_are_used() {
+    let sandbox = Sandbox::new("cli-check-deprecated-server-proxy");
+    sandbox.mcp_json(r#"{"mcpServers":{}}"#);
+    sandbox.config_json(
+        r#"{
+            "server": {
+                "listen_port": 0,
+                "proxy_port": 18080,
+                "auth_proxy_path": "/bin/true"
+            }
+        }"#,
+    );
+
+    let output = sandbox.run(&["check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("server.proxy_port is deprecated; use proxy.port instead"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("server.auth_proxy_path is deprecated; use proxy.path instead"),
+        "{stdout}"
     );
 }
 

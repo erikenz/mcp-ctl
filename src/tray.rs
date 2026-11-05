@@ -728,6 +728,7 @@ mod tests {
             name: name.to_string(),
             tool_count: 1,
             running,
+            stopped: false,
         }
     }
 

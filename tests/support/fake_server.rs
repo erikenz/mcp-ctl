@@ -13,6 +13,7 @@
 //! --tool <name>          name of the echoing tool (default: echo)
 //! --slow-ms <n>          how long the `slow` tool takes (default: 5000)
 //! --exit-file <path>     written when the server exits cleanly
+//! --exit-after-ms <n>    die on its own after n milliseconds, like a crashing server
 //! --cwd-file <path>      written with the working directory at startup
 //! --env-file <path>      written with `KEY=value` lines from the environment at startup
 //! --hang-initialize      never answer initialize
@@ -36,6 +37,7 @@ struct Options {
     tool: String,
     slow_ms: u64,
     exit_file: Option<String>,
+    exit_after_ms: Option<u64>,
     cwd_file: Option<String>,
     env_file: Option<String>,
     hang_initialize: bool,
@@ -50,6 +52,7 @@ impl Options {
             tool: "echo".to_string(),
             slow_ms: 5_000,
             exit_file: None,
+            exit_after_ms: None,
             cwd_file: None,
             env_file: None,
             hang_initialize: false,
@@ -94,6 +97,10 @@ impl Options {
                     }
                     index += 2;
                 }
+                "--exit-after-ms" => {
+                    options.exit_after_ms = value.and_then(|value| value.parse().ok());
+                    index += 2;
+                }
                 "--hang-initialize" => {
                     options.hang_initialize = true;
                     index += 1;
@@ -111,6 +118,13 @@ impl Options {
 }
 
 fn run(options: &Options) -> Result<(), String> {
+    // A backend that crashes on its own, for the automatic-restart tests.
+    if let Some(ms) = options.exit_after_ms {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            std::process::exit(1);
+        });
+    }
     // Record the startup environment before serving, so the tests can check what a
     // backend inherited (or did not inherit, with `env_clear`).
     if let Some(path) = &options.cwd_file {

@@ -17,11 +17,19 @@ use crate::servers::{McpServer, SecretSource, SecretValue};
 /// Run every check and report. Returns the number of problems found.
 pub fn run(paths: &Paths, tool_config: &ToolConfig, as_json: bool) -> Result<usize> {
     let server_config = tool_config.server();
+    let proxy_config = tool_config.proxy();
     let auth_config = tool_config.auth();
     let tunnel_config = tool_config.tunnel();
 
     let mut problems: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
+
+    if server_config.proxy_port.is_some() {
+        notes.push("server.proxy_port is deprecated; use proxy.port instead".to_string());
+    }
+    if server_config.auth_proxy_path.is_some() {
+        notes.push("server.auth_proxy_path is deprecated; use proxy.path instead".to_string());
+    }
     let mut reports: Vec<Value> = Vec::new();
     // Programs the configuration implies we will need.
     let mut needed: BTreeSet<String> = BTreeSet::new();
@@ -30,6 +38,12 @@ pub fn run(paths: &Paths, tool_config: &ToolConfig, as_json: bool) -> Result<usi
     servers.sort_by(|left, right| left.0.cmp(right.0));
 
     for (name, server) in servers {
+        if server.serve.is_some() {
+            notes.push(format!(
+                "{name}: \"serve\" is deprecated; use \"autostart\" instead"
+            ));
+        }
+
         let mut findings: Vec<Value> = Vec::new();
         let mut note = None;
         let mut status = "ok";
@@ -202,7 +216,7 @@ pub fn run(paths: &Paths, tool_config: &ToolConfig, as_json: bool) -> Result<usi
 
     if use_proxy {
         // The same lookup `up` performs: configured path, PATH, then ~/.local/bin.
-        match exposure::find_auth_proxy(&server_config) {
+        match exposure::find_auth_proxy(&proxy_config, &server_config) {
             Ok(path) => auth_proxy = Some(path),
             Err(error) => problems.push(
                 error

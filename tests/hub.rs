@@ -735,3 +735,197 @@ fn wait_for_text(path: &std::path::Path, timeout: Duration) -> String {
     }
     panic!("{} was not written within the timeout", path.display());
 }
+
+/// A configured entry that nothing serves until someone asks for it.
+fn staged_server_entry(name: &str, tool: &str) -> String {
+    let command = json_string(env!("CARGO_BIN_EXE_mcp-fake-server"));
+    format!(
+        r#""{name}": {{ "command": {command}, "args": ["--name", "{name}", "--tool", "{tool}"] }}"#
+    )
+}
+
+/// A `serve: true` entry whose backend exits on its own shortly after starting.
+fn crashing_server_entry(name: &str, tool: &str, exit_after_ms: u64, restart: bool) -> String {
+    let command = json_string(env!("CARGO_BIN_EXE_mcp-fake-server"));
+    let policy = if restart {
+        r#", "restart": "on-failure""#
+    } else {
+        ""
+    };
+    format!(
+        r#""{name}": {{ "command": {command}, "args": ["--name", "{name}", "--tool", "{tool}", "--exit-after-ms", "{exit_after_ms}"], "serve": true{policy} }}"#
+    )
+}
+
+/// The pid the daemon recorded, so a test can prove nothing was restarted.
+fn daemon_pid(sandbox: &Sandbox) -> u64 {
+    let text = std::fs::read_to_string(sandbox.state_dir().join("daemon.json"))
+        .expect("the daemon writes a state file");
+    let state: Value = serde_json::from_str(&text).expect("the state file is JSON");
+    state["pid"].as_u64().expect("the state file records a pid")
+}
+
+/// Wait for the daemon log to contain `needle`.
+fn wait_for_log(state_dir: &std::path::Path, needle: &str, timeout: Duration) -> String {
+    let path = state_dir.join("mcp-ctl.log");
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && text.contains(needle)
+        {
+            return text;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    panic!("the log never mentioned {needle:?}:\n{text}");
+}
+
+#[test]
+fn a_server_starts_and_stops_without_restarting_the_hub() {
+    let sandbox = Sandbox::new("hub-lifecycle");
+    sandbox.mcp_json(&mcp_json_with(&[
+        fake_server_entry("alpha", &[]),
+        staged_server_entry("beta", "beta_echo"),
+    ]));
+    let daemon = Daemon::start(sandbox);
+    let pid_before = daemon_pid(&daemon.sandbox);
+
+    // Only the served server is up.
+    let tools = tools_at(daemon.hub_port);
+    assert!(tools.contains(&"echo".to_string()), "{tools:?}");
+    assert!(!tools.contains(&"beta_echo".to_string()), "{tools:?}");
+
+    let start = daemon.sandbox.run(&["server", "start", "beta"]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&start.stdout).to_string();
+    assert!(stdout.contains("started 'beta'"), "{stdout}");
+
+    // Published before the reply arrives, so this needs no polling.
+    let tools = tools_at(daemon.hub_port);
+    assert!(tools.contains(&"beta_echo".to_string()), "{tools:?}");
+    assert!(tools.contains(&"echo".to_string()), "{tools:?}");
+
+    // The server that was already up never noticed.
+    let echo = daemon.call_tool("echo");
+    assert_eq!(echo.status, 200, "{}", echo.body);
+
+    let stop = daemon.sandbox.run(&["server", "stop", "beta"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let tools = tools_at(daemon.hub_port);
+    assert!(!tools.contains(&"beta_echo".to_string()), "{tools:?}");
+    assert!(tools.contains(&"echo".to_string()), "{tools:?}");
+    let echo = daemon.call_tool("echo");
+    assert_eq!(echo.status, 200, "{}", echo.body);
+
+    // Restart is stop-then-start, and still leaves the hub and alpha alone.
+    let restart = daemon.sandbox.run(&["server", "restart", "beta"]);
+    assert!(
+        restart.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    let tools = tools_at(daemon.hub_port);
+    assert!(tools.contains(&"beta_echo".to_string()), "{tools:?}");
+
+    assert_eq!(
+        daemon_pid(&daemon.sandbox),
+        pid_before,
+        "the hub itself must not have been restarted"
+    );
+
+    // An unknown name is an error, not a silent no-op.
+    let unknown = daemon.sandbox.run(&["server", "start", "nope"]);
+    assert!(!unknown.status.success());
+    let stderr = String::from_utf8_lossy(&unknown.stderr).to_string();
+    assert!(stderr.contains("not in"), "{stderr}");
+}
+
+#[test]
+fn status_reports_stopped_and_idle_servers() {
+    let sandbox = Sandbox::new("hub-status-stopped");
+    sandbox.mcp_json(&mcp_json_with(&[
+        fake_server_entry("alpha", &[]),
+        staged_server_entry("beta", "beta_echo"),
+        staged_server_entry("gamma", "gamma_echo"),
+    ]));
+    let daemon = Daemon::start_with(
+        sandbox,
+        &[
+            "up",
+            "-d",
+            "--no-tunnel",
+            "--no-auth",
+            "--port=0",
+            "alpha",
+            "beta",
+        ],
+    );
+
+    let stop = daemon.sandbox.run(&["server", "stop", "beta"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+
+    let status = daemon.sandbox.run(&["status"]);
+    let text = String::from_utf8_lossy(&status.stdout).to_string();
+    assert!(text.contains("alpha (3 tools)"), "{text}");
+    // Stopped on purpose, which must not read like a crash.
+    assert!(text.contains("beta (stopped)"), "{text}");
+    assert!(!text.contains("(exited)"), "{text}");
+    // Configured but never served by this daemon.
+    assert!(text.contains("Idle:"), "{text}");
+    assert!(text.contains("gamma"), "{text}");
+}
+
+#[test]
+fn a_crashing_server_comes_back_when_the_profile_asks_for_it() {
+    let sandbox = Sandbox::new("hub-restart-policy");
+    sandbox.mcp_json(&mcp_json_with(&[
+        fake_server_entry("alpha", &[]),
+        crashing_server_entry("flappy", "flappy_echo", 2_000, true),
+    ]));
+    let daemon = Daemon::start(sandbox);
+
+    // The crash is noticed and the backend is respawned, without a whole service restart.
+    let log = wait_for_log(
+        &daemon.sandbox.state_dir(),
+        "Restarted 'flappy'",
+        Duration::from_secs(30),
+    );
+    assert!(log.contains("no longer served"), "{log}");
+    assert!(log.contains("Restarting 'flappy' in 1s"), "{log}");
+    // The healthy server kept serving through all of it.
+    assert!(tools_at(daemon.hub_port).contains(&"echo".to_string()));
+}
+
+#[test]
+fn a_crashing_server_without_the_policy_stays_down() {
+    let sandbox = Sandbox::new("hub-no-restart-policy");
+    sandbox.mcp_json(&mcp_json_with(&[
+        fake_server_entry("alpha", &[]),
+        crashing_server_entry("flappy", "flappy_echo", 1_500, false),
+    ]));
+    let daemon = Daemon::start(sandbox);
+
+    let log = wait_for_log(
+        &daemon.sandbox.state_dir(),
+        "no longer served",
+        Duration::from_secs(30),
+    );
+    assert!(!log.contains("Restarting 'flappy'"), "{log}");
+    // Its tools are gone; the others are not.
+    let tools = tools_at(daemon.hub_port);
+    assert!(!tools.contains(&"flappy_echo".to_string()), "{tools:?}");
+    assert!(tools.contains(&"echo".to_string()), "{tools:?}");
+}

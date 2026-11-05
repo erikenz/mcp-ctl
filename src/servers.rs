@@ -11,6 +11,21 @@ fn default_true() -> bool {
     true
 }
 
+/// What to do when this server exits on its own.
+///
+/// Off by default: a server that cannot start would otherwise be respawned for as long
+/// as the daemon runs. `mcp-ctl server start <name>` always works by hand, whatever
+/// this is set to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    /// Leave it stopped; its tools disappear from the hub.
+    #[default]
+    Never,
+    /// Start it again with backoff, up to a small cap, then give up loudly.
+    OnFailure,
+}
+
 /// One server definition.
 ///
 /// Unknown keys are deliberately ignored: the same file is read by other MCP
@@ -41,12 +56,19 @@ pub struct McpServer {
     /// token, and sign in on demand".
     #[serde(default)]
     pub auth: RemoteAuth,
-    /// Whether `mcp-ctl up` (without `--all`) serves this server.
+    /// Whether `mcp-ctl up` (without `--all`) starts this server on daemon startup.
     #[serde(default)]
-    pub serve: bool,
+    pub autostart: Option<bool>,
+    /// Deprecated synonym for `autostart`.
+    #[serde(default)]
+    pub serve: Option<bool>,
     /// Whether this server is enabled at all.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Restart this server when it exits unexpectedly; `"never"` (the default) leaves it
+    /// stopped until someone runs `mcp-ctl server start`.
+    #[serde(default)]
+    pub restart: RestartPolicy,
     /// Optional tool prefix, so `create_issue` becomes `github_create_issue`.
     #[serde(default)]
     pub prefix: Option<String>,
@@ -329,6 +351,13 @@ impl McpServer {
             None => fallback,
         }
     }
+
+    /// Whether `mcp-ctl up` (without `--all`) starts this server on daemon startup.
+    ///
+    /// Prefers `autostart`, falling back to the deprecated `serve` key.
+    pub fn autostart(&self) -> bool {
+        self.autostart.or(self.serve).unwrap_or(false)
+    }
 }
 
 /// Resolve every env entry of a server. Values stay in memory and are handed to
@@ -379,7 +408,7 @@ pub fn resolve_env_with_timeout(
 ///  * servers with `"enabled": false` are skipped with a warning;
 ///  * entries that are neither a `command` nor a `url` are skipped with a warning;
 ///  * without names, `--all` selects every server and the default selects the ones
-///    marked `"serve": true`.
+///    marked `"autostart": true`.
 pub fn select<'a>(
     servers: &'a BTreeMap<String, McpServer>,
     names: &[String],
@@ -409,7 +438,7 @@ pub fn select<'a>(
     let mut selected = Vec::new();
     for (name, server) in servers {
         let wanted = if names.is_empty() {
-            all || server.serve
+            all || server.autostart()
         } else {
             names.contains(name)
         };
@@ -431,7 +460,7 @@ pub fn select<'a>(
         bail!(
             "no servers to serve{}",
             if names.is_empty() && !all {
-                ": add \"serve\": true to a server in config.json, or pass --all"
+                ": add \"autostart\": true to a server in config.json, or pass --all"
             } else {
                 " (see the warnings above)"
             }
@@ -500,7 +529,8 @@ mod tests {
 
         let mcp = parse(json);
         let server = mcp.get("test-server").expect("server not found");
-        assert!(server.serve);
+        assert!(server.autostart());
+        assert_eq!(server.serve, Some(true));
         assert!(server.enabled);
         assert_eq!(server.command.as_deref(), Some("echo"));
         assert_eq!(server.args, vec!["hello"]);
@@ -511,6 +541,24 @@ mod tests {
         crate::config::ToolConfig::load_from_str(json)
             .expect("a valid profile file")
             .mcp_servers
+    }
+
+    #[test]
+    fn autostart_prefers_explicit_key_and_falls_back_to_serve() {
+        let mcp = parse(
+            r#"{"mcpServers":{
+                "new":{"command":"true","autostart":true},
+                "legacy":{"command":"true","serve":true},
+                "override_to_false":{"command":"true","autostart":false,"serve":true},
+                "override_to_true":{"command":"true","autostart":true,"serve":false},
+                "neither":{"command":"true"}
+            }}"#,
+        );
+        assert!(mcp["new"].autostart());
+        assert!(mcp["legacy"].autostart());
+        assert!(!mcp["override_to_false"].autostart());
+        assert!(mcp["override_to_true"].autostart());
+        assert!(!mcp["neither"].autostart());
     }
 
     #[test]
@@ -558,7 +606,7 @@ mod tests {
         let mcp = parse(r#"{"mcpServers":{"a":{"command":"true"}}}"#);
         let error = select(&mcp, &[], false).unwrap_err().to_string();
         assert!(error.contains("no servers to serve"), "{error}");
-        assert!(error.contains("serve"), "{error}");
+        assert!(error.contains("autostart"), "{error}");
     }
 
     #[test]

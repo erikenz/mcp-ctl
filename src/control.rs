@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::config::Paths;
+use crate::config::{Paths, ServerConfig, ToolConfig};
 use crate::hub::Hub;
 use crate::platform;
 use std::path::Path;
@@ -135,6 +135,10 @@ pub struct ServerStatus {
     /// False once the backend process has exited and its tools were withdrawn.
     #[serde(default = "alive_by_default")]
     pub alive: bool,
+    /// True when it was stopped on purpose, so a report can say "stopped" instead of
+    /// "exited" and nobody goes looking for a crash that never happened.
+    #[serde(default)]
+    pub stopped: bool,
 }
 
 fn alive_by_default() -> bool {
@@ -164,9 +168,14 @@ impl ControlInfo {
             auth_methods: self.auth_methods.clone(),
             ready: self.ready.load(Ordering::SeqCst),
             servers: hub
-                .summarize()
+                .statuses()
                 .into_iter()
-                .map(|(name, tools, alive)| ServerStatus { name, tools, alive })
+                .map(|server| ServerStatus {
+                    name: server.name,
+                    tools: server.tool_count,
+                    alive: server.running,
+                    stopped: server.stopped,
+                })
                 .collect(),
             total_tools: hub.tool_count(),
             calls: hub.calls(),
@@ -175,11 +184,109 @@ impl ControlInfo {
     }
 }
 
+/// What the control channel needs to start a server on request: where the profile and
+/// its secrets live, and the settings the daemon is running with.
+///
+/// Settings still come from the running daemon (`mcp-ctl restart` is what changes them);
+/// only the server catalogue is re-read, so a server added or edited since `up` can be
+/// started without restarting anything.
+pub struct BackendContext {
+    pub paths: Paths,
+    pub server: ServerConfig,
+}
+
+/// Start, stop or restart the servers a request names.
+///
+/// One line per server either way, so a partly successful command still tells the
+/// operator exactly what happened to each name.
+fn lifecycle_reply(hub: &Hub, context: &BackendContext, command: &str, names: &[String]) -> Reply {
+    if names.is_empty() {
+        return Reply::failed(format!(
+            "'{command}' needs at least one server name (`mcp-ctl status` lists the running ones)"
+        ));
+    }
+    let config = match ToolConfig::load_from(&context.paths.config_file) {
+        Ok(config) => config,
+        Err(error) => {
+            return Reply::failed(format!("cannot read the profile: {error:#}"));
+        }
+    };
+
+    let mut lines = Vec::new();
+    let mut failures = 0;
+    for name in names {
+        let outcome = match command {
+            "start" => start_server(hub, context, &config, name),
+            "stop" => stop_server(hub, &config, name),
+            // Restart is stop-then-start, and the stop line is dropped: what the
+            // operator asked for is the server being up again.
+            _ => stop_server(hub, &config, name)
+                .and_then(|_| start_server(hub, context, &config, name)),
+        };
+        match outcome {
+            Ok(line) => lines.push(line),
+            Err(error) => {
+                failures += 1;
+                lines.push(format!("'{name}': {error:#}"));
+            }
+        }
+    }
+
+    Reply {
+        ok: failures == 0,
+        error: (failures > 0).then(|| lines.join("; ")),
+        status: None,
+        message: Some(lines.join("\n")),
+    }
+}
+
+fn start_server(
+    hub: &Hub,
+    context: &BackendContext,
+    config: &ToolConfig,
+    name: &str,
+) -> Result<String> {
+    if hub.is_running(name) {
+        bail!("already running");
+    }
+    let Some(server) = config.mcp_servers.get(name) else {
+        bail!(
+            "not in {} (`mcp-ctl list` shows the configured servers)",
+            context.paths.config_file.display()
+        );
+    };
+    if !server.enabled {
+        bail!("has \"enabled\": false in the profile");
+    }
+    let published =
+        crate::orchestrator::start_backend(hub, &context.paths, &context.server, name, server)?;
+    Ok(format!(
+        "started '{name}' ({published} tool{})",
+        if published == 1 { "" } else { "s" }
+    ))
+}
+
+fn stop_server(hub: &Hub, config: &ToolConfig, name: &str) -> Result<String> {
+    // A typo should be an error, not a silent no-op; a staged server that was never
+    // started should not be one either.
+    if !hub.knows(name) && !config.mcp_servers.contains_key(name) {
+        bail!("unknown server (`mcp-ctl list` shows the configured ones)");
+    }
+    if hub.stop_backend(name)? {
+        Ok(format!("stopped '{name}'"))
+    } else {
+        Ok(format!("'{name}' was not running"))
+    }
+}
+
 /// One line of JSON in each direction.
 #[derive(Serialize, Deserialize)]
 struct Message {
     token: String,
     command: String,
+    /// Servers a `start`, `stop` or `restart` request names.
+    #[serde(default)]
+    names: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -189,6 +296,9 @@ struct Reply {
     error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     status: Option<StatusReport>,
+    /// One line per server a lifecycle command acted on, for the CLI to print.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
 }
 
 impl Reply {
@@ -197,6 +307,7 @@ impl Reply {
             ok: false,
             error: Some(message.into()),
             status: None,
+            message: None,
         }
     }
 }
@@ -241,7 +352,13 @@ impl ControlServer {
     /// Every connection is answered on its own thread, so a client that connects and then
     /// says nothing holds only its own thread for the read timeout instead of delaying
     /// `status` or `stop` behind it.
-    pub fn serve(self, info: Arc<ControlInfo>, hub: Arc<Hub>, stop: Sender<()>) {
+    pub fn serve(
+        self,
+        info: Arc<ControlInfo>,
+        hub: Arc<Hub>,
+        stop: Sender<()>,
+        context: Arc<BackendContext>,
+    ) {
         let in_flight = Arc::new(AtomicUsize::new(0));
         let mut last_spawn_error: Option<Instant> = None;
         loop {
@@ -263,6 +380,7 @@ impl ControlServer {
             let info = Arc::clone(&info);
             let hub = Arc::clone(&hub);
             let stop = stop.clone();
+            let context = Arc::clone(&context);
             let guard = ControlGuard(Arc::clone(&in_flight));
             // A refused thread must not take the control channel down with it: the
             // next request gets another chance instead of the daemon becoming
@@ -273,7 +391,7 @@ impl ControlServer {
                     let _guard = guard;
                     let _ = stream.set_read_timeout(Some(CONTROL_TIMEOUT));
                     let _ = stream.set_write_timeout(Some(CONTROL_TIMEOUT));
-                    if let Err(error) = answer(&stream, &token, &info, &hub, &stop) {
+                    if let Err(error) = answer(&stream, &token, &info, &hub, &stop, &context) {
                         errln!("warning: control request failed: {error}");
                     }
                 });
@@ -308,6 +426,7 @@ fn answer(
     info: &ControlInfo,
     hub: &Hub,
     stop: &Sender<()>,
+    context: &BackendContext,
 ) -> Result<()> {
     let mut line = String::new();
     let read = BufReader::new(stream)
@@ -336,7 +455,14 @@ fn answer(
                 ok: true,
                 error: None,
                 status: Some(info.report(hub)),
+                message: None,
             },
+        ),
+        // Start, stop or restart servers without touching the rest of the hub: the
+        // registry is made for this, so a change costs a lock, not a restart.
+        "start" | "stop" | "restart" => write_reply(
+            stream,
+            &lifecycle_reply(hub, context, &message.command, &message.names),
         ),
         "shutdown" => {
             write_reply(
@@ -345,6 +471,7 @@ fn answer(
                     ok: true,
                     error: None,
                     status: None,
+                    message: None,
                 },
             )?;
             // The supervisor loop owns shutdown: asking it to stop is what triggers the
@@ -372,6 +499,19 @@ fn write_reply(mut stream: &TcpStream, reply: &Reply) -> Result<()> {
 }
 
 fn request(state: &StateFile, command: &str) -> Result<Reply> {
+    request_with(state, command, &[])
+}
+
+/// Ask a running daemon to start, stop or restart the servers it is given.
+///
+/// Returns its one-line-per-server report, which is what the CLI prints. A partial
+/// failure lists every name, so the operator can see which half worked.
+pub fn request_backends(state: &StateFile, command: &str, names: &[String]) -> Result<String> {
+    let reply = request_with(state, command, names)?;
+    Ok(reply.message.unwrap_or_default())
+}
+
+fn request_with(state: &StateFile, command: &str, names: &[String]) -> Result<Reply> {
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, state.control_port));
     let stream = TcpStream::connect_timeout(&address, CONTROL_TIMEOUT)
         .with_context(|| format!("no mcp-ctl daemon is listening on {address}"))?;
@@ -381,6 +521,7 @@ fn request(state: &StateFile, command: &str) -> Result<Reply> {
     let message = serde_json::to_string(&Message {
         token: state.token.clone(),
         command: command.to_string(),
+        names: names.to_vec(),
     })?;
     let mut writer = &stream;
     writer
@@ -619,6 +760,15 @@ mod tests {
         }
     }
 
+    /// A context for tests that only exercise status and shutdown: no real profile, so
+    /// a lifecycle command would report "cannot read the profile" rather than act.
+    fn test_context() -> BackendContext {
+        BackendContext {
+            paths: paths_in(&std::env::temp_dir().join("mcp-ctl-no-such-profile")),
+            server: ServerConfig::default(),
+        }
+    }
+
     fn state_for(port: u16, token: &str) -> StateFile {
         StateFile {
             format: StateFile::FORMAT,
@@ -656,7 +806,8 @@ mod tests {
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let info = Arc::new(test_info());
         let hub = Arc::new(Hub::new());
-        let _daemon = std::thread::spawn(move || server.serve(info, hub, stop_tx));
+        let _daemon =
+            std::thread::spawn(move || server.serve(info, hub, stop_tx, Arc::new(test_context())));
         (port, token, stop_rx)
     }
 
@@ -672,8 +823,15 @@ mod tests {
         drop(client);
 
         let (stop_tx, _stop_rx) = std::sync::mpsc::channel();
-        answer(&server, "token", &test_info(), &Hub::new(), &stop_tx)
-            .expect("a liveness probe must not be reported as a malformed request");
+        answer(
+            &server,
+            "token",
+            &test_info(),
+            &Hub::new(),
+            &stop_tx,
+            &test_context(),
+        )
+        .expect("a liveness probe must not be reported as a malformed request");
     }
 
     #[test]
@@ -838,7 +996,7 @@ mod tests {
         };
         let hub = Hub::new();
         let (stop, _stop_rx) = std::sync::mpsc::channel();
-        let error = answer(&server, "token", &info, &hub, &stop).unwrap_err();
+        let error = answer(&server, "token", &info, &hub, &stop, &test_context()).unwrap_err();
         assert!(error.to_string().contains("too long"), "{error}");
     }
 

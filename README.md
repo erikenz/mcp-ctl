@@ -46,7 +46,7 @@ cargo install mcp-ctl
 ```bash
 mcp-ctl init     # write ~/.config/mcp-ctl/config.json and an owner-only .env
 mcp-ctl check    # validate it, resolve every secret, flag busy ports
-mcp-ctl up       # serve the servers marked "serve": true
+mcp-ctl up       # serve the servers marked "autostart": true
 ```
 
 `init` writes a single profile file holding both the servers and mcp-ctl's own settings:
@@ -58,7 +58,7 @@ mcp-ctl up       # serve the servers marked "serve": true
     "chrome-devtools": {
       "command": "npx",
       "args": ["-y", "chrome-devtools-mcp@latest", "--browser-url=http://127.0.0.1:9222"],
-      "serve": true
+      "autostart": true
     },
     "github": {
       "command": "docker",
@@ -84,6 +84,9 @@ mcp-ctl run <name>        # run one server on stdio, for a local editor
 mcp-ctl auth login <name> # sign in to a remote server that wants OAuth
 mcp-ctl auth status       # which remote servers have a usable token
 mcp-ctl up                # serve over HTTP; add -d for the background daemon
+mcp-ctl server start <name>    # start one server in the running hub, without a restart
+mcp-ctl server stop <name>     # stop it again; every other server keeps serving
+mcp-ctl server restart <name>  # stop, then start: what a crashed or wedged one needs
 mcp-ctl status            # what the service is doing (--json for scripts)
 mcp-ctl logs -f           # follow the daemon log
 mcp-ctl restart           # pick up config changes
@@ -104,8 +107,9 @@ mcp-ctl update            # update in place, when the install script owns the bi
 | `url` | — | A remote MCP server over Streamable HTTP. Served like a local one; OAuth is used when the server asks for it. |
 | `headers` | — | Headers for a remote server, keyed by name. Values are secret sources. An `Authorization` header is used as given and turns OAuth off for that server. |
 | `auth` | OAuth | `{"type": "oauth", "scopes": [...], "client_id": ..., "client_secret": ...}` or `{"type": "none"}`. |
-| `serve` | `false` | Whether `mcp-ctl up` serves this server without it being named on the command line. |
+| `serve` | `false` | Whether `mcp-ctl up` starts this server without it being named on the command line. A server that is not started is not reachable at all: nothing is published until `up`, `--all`, `serve: true` or `mcp-ctl server start` brings it in. |
 | `enabled` | `true` | Set to `false` to keep an entry but ignore it everywhere. |
+| `restart` | `never` | `on-failure` restarts this server when it exits on its own, with backoff and a five-attempt cap. |
 | `prefix` | — | Prefix this server's tool names, e.g. `github_create_issue`. |
 | `timeout_secs` | — | Overrides `server.tool_timeout_secs` for this server; `0` waits forever, the maximum is `86400` (24 hours). |
 | `tools.include` / `tools.exclude` | — | Publish only some of the server's tools. A pattern is a tool name or a prefix ending in `*`. |
@@ -122,7 +126,7 @@ provider-specific about it, and `mcp-ctl` has no allowlist of servers: anything 
 speaks MCP over Streamable HTTP works.
 
 ```json
-"some-remote-server": { "url": "https://mcp.example.com/mcp", "serve": true }
+"some-remote-server": { "url": "https://mcp.example.com/mcp", "autostart": true }
 ```
 
 **Signing in is local.** When a remote server answers `401`, it advertises where to
@@ -188,18 +192,20 @@ stdin/stdout, for editors that do not speak HTTP.
 
 ### Settings
 
-Every key is optional. Out of the box mcp-ctl serves `"serve": true` entries on `127.0.0.1`, with no tunnel and no authentication.
+Every key is optional. Out of the box mcp-ctl serves `"autostart": true` entries on `127.0.0.1`, with no tunnel and no authentication. (`"serve"` is accepted as a deprecated synonym for `"autostart"`.)
 
 | Key | Default | Meaning |
 | :--- | :--- | :--- |
 | `server.bind` | `127.0.0.1` | Address the hub binds to. It has no authentication of its own; `auth.bearer_token` is the only thing that protects this port. A non-loopback bind with proxy-only auth is refused. |
 | `server.listen_port` | `37373` | Hub port. `0` asks the operating system for a free one. |
-| `server.proxy_port` | `8080` | Port the auth proxy listens on. `0` is not supported: the tunnel target and `status` need the real port. |
 | `server.external_url` | — | Public URL clients use, for OAuth callbacks and browser origins. Required once `mcp-auth-proxy` is enabled; Tailscale can supply it. Must be `https://` unless it is a loopback URL for local testing. |
-| `server.auth_proxy_path` | — | Where `mcp-auth-proxy` lives, if it is not on `PATH`. |
 | `server.tool_timeout_secs` | `300` | How long one backend tool call may take; `0` waits forever, the maximum is `86400` (24 hours). |
 | `server.secret_timeout_secs` | `30` | How long one external secret lookup may take while starting; a timeout skips that server. `0` waits forever, the maximum is `86400` (24 hours). |
 | `server.allowed_origins` | `[]` | Extra browser origins allowed to call the hub. Origins on a host mcp-ctl is served on are allowed without being listed. |
+| `proxy.enabled` | `auto` | Whether `mcp-auth-proxy` is enabled. By default (`auto`), it runs if password or OAuth authentication is configured in `auth`. Set to `false` to disable the auth proxy even if credentials exist, or `true` to require it. |
+| `proxy.port` | `8080` | Port the auth proxy listens on. `0` is not supported: the tunnel target and `status` need the real port. (`server.proxy_port` is accepted as a deprecated synonym.) |
+| `proxy.path` | — | Where `mcp-auth-proxy` lives, if it is not on `PATH` or in `~/.local/bin`. (`server.auth_proxy_path` is accepted as a deprecated synonym.) |
+| `proxy.external_url` | — | Public URL clients use to reach the auth proxy. (Can also be set as `server.external_url`.) |
 | `tunnel.provider` | `none` | `none`, `tailscale` or `cloudflared`. |
 | `tunnel.auto_start` | `true` | Start the tunnel when a provider is configured. |
 | `tunnel.port` | — | Local port the tunnel forwards to. Defaults to the auth proxy's port, or the hub's. With proxy auth it must be the proxy port; a tunnel aimed at the unauthenticated hub is refused. |
@@ -262,10 +268,50 @@ mcp-ctl --profile work stop      # stop it; other profiles keep running
 
 The default profile keeps the paths above, so a single-profile installation is unchanged. A named profile keeps its daemon state under `profiles/<name>/`, with its own lock and log, which is what lets two daemons run at once. Give each profile its own `listen_port` and `proxy_port`, or start it with `--port 0`. `MCP_CTL_PROFILE=work` does the same for editors that cannot pass flags, and a profile name is one path-safe segment (`../escape` is rejected).
 
+### Starting and stopping one server
+
+A server with `"autostart": false` (or without `"autostart"`) is configured but not started by `up`. Start it when you
+need it, and stop it again when you are done:
+
+```bash
+mcp-ctl server start oncall     # its tools appear on the hub
+mcp-ctl server stop oncall      # gone again; the other servers never noticed
+mcp-ctl server restart oncall   # stop, then start: what a wedged server needs
+```
+
+Only that backend changes. The hub keeps its port and the servers it already had, so
+their clients keep working and no tool call in flight is dropped (`mcp-ctl status`
+confirms it: the hub PID is unchanged). This is the cheap alternative to flipping
+`"enabled"` and restarting the profile, which stops everything it serves.
+
+One thing to be clear about: there is no "running but hidden" state. A server is either
+not started (so it is not reachable through the hub at all) or started and published on
+`/mcp` — publishing is what the hub is for. Keeping a dozen entries in the profile with
+`"autostart": false` exposes none of them; `mcp-ctl server start` is the switch that brings
+one in. Reaching a single server *without* the hub is `mcp-ctl run <name>` on stdio, and
+reaching different sets of servers with different authentication is a separate profile.
+
+Two limits worth knowing:
+
+- A client that already listed tools will not see the new ones until it lists again.
+mcp-ctl has no session and no event stream, so `notifications/tools/list_changed` is
+never sent: reconnect or re-list on the client side.
+- `server start` re-reads the profile file, so a server added or edited since `up` starts
+with its new definition. Everything else — ports, timeouts, auth — is settled by the
+daemon at startup and still needs `mcp-ctl restart`. `.env` is read once at startup too,
+so a new secret there also needs a restart (`mcp-ctl check` reports it first).
+
+A backend that crashes on its own already behaves like `server stop`: its tools are
+withdrawn and the rest keep serving. `"restart": "on-failure"` brings it back without
+help — one second, then doubling, at most five attempts in a row, and the count resets
+once it has stayed up for a minute. Without that key the server stays down until
+`mcp-ctl server start <name>`. `mcp-ctl status` lists a stopped server as `(stopped)`, a
+crashed one as `(exited)`, and one that was never started under `Idle:`.
+
 ## Serving over HTTP
 
 ```bash
-mcp-ctl up                         # every server with "serve": true, in the foreground
+mcp-ctl up                         # every server with "autostart": true, in the foreground
 mcp-ctl up chrome-devtools sentry  # only these
 mcp-ctl up --all                   # every enabled server
 mcp-ctl up --no-tunnel --no-auth   # local only

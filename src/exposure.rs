@@ -9,7 +9,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::config::{ServerConfig, ToolConfig, TunnelProvider};
+use crate::config::{ProxyConfig, ServerConfig, ToolConfig, TunnelProvider};
 
 /// The command-line choices that change what `up` will do.
 #[derive(Clone, Debug, Default)]
@@ -58,21 +58,23 @@ pub struct Decision {
 /// Work out the plan, and everything `up` would refuse about it.
 pub fn decide(config: &ToolConfig, request: &Request) -> Decision {
     let server = config.server();
+    let proxy = config.proxy();
     let auth = config.auth();
     let tunnel = config.tunnel();
 
     let bind = request.bind.unwrap_or(server.bind);
     let hub_port = request.port.unwrap_or(server.listen_port);
-    let proxy_port = request.proxy_port.unwrap_or(server.proxy_port);
+    let proxy_port = request.proxy_port.unwrap_or_else(|| proxy.port(&server));
     let external_url = request
         .external_url
         .clone()
-        .or_else(|| server.external_url())
+        .or_else(|| config.external_url())
         .or_else(|| public_url_from_tailscale(tunnel.provider));
 
     // Two independent mechanisms: `mcp-auth-proxy` for OAuth/password sign-in, and a
     // static bearer token the hub checks itself. `--no-auth` disables both.
-    let use_proxy = !request.no_auth && auth.proxy_enabled();
+    let proxy_enabled = proxy.is_enabled(&auth);
+    let use_proxy = !request.no_auth && proxy_enabled;
     let use_bearer = !request.no_auth && auth.bearer_token.is_some();
     let use_auth = use_proxy || use_bearer;
     let use_tunnel =
@@ -92,13 +94,26 @@ pub fn decide(config: &ToolConfig, request: &Request) -> Decision {
 
     if request.no_auth && auth.is_enabled() {
         notes.push("warning: authentication is configured but disabled by --no-auth".to_string());
+    } else if proxy.enabled == Some(false) && auth.proxy_enabled() {
+        notes.push(
+            "warning: proxy authentication is configured in 'auth' but disabled by proxy.enabled = false"
+                .to_string(),
+        );
+    }
+
+    if proxy.enabled == Some(true) && !auth.proxy_enabled() {
+        refusals.push(
+            "proxy.enabled is true, but no authentication method is configured in auth.\n\
+             Set auth.password, auth.github_client_id/secret, or auth.google_client_id/secret."
+                .to_string(),
+        );
     }
 
     if use_proxy && proxy_port == 0 {
         refusals.push(
             "server.proxy_port must not be 0: the auth proxy's real port is needed for the \
              tunnel target and for `status`, and mcp-ctl cannot discover a port the proxy \
-             chooses itself.\nSet server.proxy_port (or pass --proxy-port) to a fixed port."
+             chooses itself.\nSet proxy.port (or pass --proxy-port) to a fixed port."
                 .to_string(),
         );
     }
@@ -221,12 +236,12 @@ pub fn detect_tailscale_external_url() -> Result<String> {
 ///
 /// `check` uses the same lookup, so a proxy that `up` can find is never reported as
 /// missing (and vice versa).
-pub fn find_auth_proxy(server_config: &ServerConfig) -> Result<String> {
-    if let Some(path) = &server_config.auth_proxy_path {
+pub fn find_auth_proxy(proxy_config: &ProxyConfig, server_config: &ServerConfig) -> Result<String> {
+    if let Some(path) = proxy_config.path(server_config) {
         if path.is_file() {
             return Ok(path.to_string_lossy().to_string());
         }
-        bail!("server.auth_proxy_path '{}' does not exist", path.display());
+        bail!("auth proxy path '{}' does not exist", path.display());
     }
 
     if let Some(path) = crate::platform::find_executable("mcp-auth-proxy") {
@@ -244,7 +259,7 @@ pub fn find_auth_proxy(server_config: &ServerConfig) -> Result<String> {
         "mcp-auth-proxy was not found.\n\
          mcp-ctl uses it as the OAuth 2.1 / password gateway in front of the hub.\n\
          Install it from https://github.com/sigbit/mcp-auth-proxy/releases (into \
-         ~/.local/bin or anywhere on PATH), set server.auth_proxy_path in config.json, \
+         ~/.local/bin or anywhere on PATH), set proxy.path (or server.auth_proxy_path) in config.json, \
          or run with --no-auth for local use only."
     )
 }
@@ -563,6 +578,68 @@ mod tests {
         );
         assert!(decision.bind.is_loopback());
         assert_eq!(decision.hub_port, 0);
+        assert!(decision.refusals.is_empty(), "{:?}", decision.refusals);
+    }
+
+    #[test]
+    fn proxy_can_be_disabled_with_proxy_enabled_false() {
+        let decision = decide(
+            &config(
+                r#"{
+                    "proxy": {"enabled": false},
+                    "auth": {"password": {"source": "env", "name": "MCP_CTL_AUTH_PASSWORD"}}
+                }"#,
+            ),
+            &request(),
+        );
+        assert!(!decision.use_proxy);
+        assert!(decision.refusals.is_empty(), "{:?}", decision.refusals);
+        assert!(
+            decision
+                .notes
+                .iter()
+                .any(|note| note.contains("disabled by proxy.enabled = false")),
+            "{:?}",
+            decision.notes
+        );
+    }
+
+    #[test]
+    fn proxy_enabled_true_requires_auth_credentials() {
+        let decision = decide(
+            &config(
+                r#"{"proxy": {"enabled": true, "external_url": "https://laptop.example.ts.net"}}"#,
+            ),
+            &request(),
+        );
+        assert!(
+            decision.refusals.iter().any(|refusal| refusal
+                .contains("proxy.enabled is true, but no authentication method is configured")),
+            "{:?}",
+            decision.refusals
+        );
+    }
+
+    #[test]
+    fn proxy_section_configures_port_and_external_url() {
+        let decision = decide(
+            &config(
+                r#"{
+                    "proxy": {
+                        "port": 9090,
+                        "external_url": "https://laptop.example.ts.net"
+                    },
+                    "auth": {"password": {"source": "env", "name": "MCP_CTL_AUTH_PASSWORD"}}
+                }"#,
+            ),
+            &request(),
+        );
+        assert!(decision.use_proxy);
+        assert_eq!(decision.proxy_port, 9090);
+        assert_eq!(
+            decision.external_url.as_deref(),
+            Some("https://laptop.example.ts.net")
+        );
         assert!(decision.refusals.is_empty(), "{:?}", decision.refusals);
     }
 }

@@ -36,8 +36,7 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 65535,
-          "default": 8080,
-          "description": "Port the auth proxy listens on. 0 is not supported: the tunnel target and status need the real port."
+          "description": "Deprecated synonym for `proxy.port`. Port the auth proxy listens on."
         },
         "external_url": {
           "type": "string",
@@ -45,7 +44,7 @@
         },
         "auth_proxy_path": {
           "type": "string",
-          "description": "Where mcp-auth-proxy lives, if it is not on PATH."
+          "description": "Deprecated synonym for `proxy.path`. Where mcp-auth-proxy lives, if it is not on PATH."
         },
         "tool_timeout_secs": {
           "type": "integer",
@@ -65,6 +64,32 @@
             "type": "string"
           },
           "description": "Extra browser origins allowed to call the hub, for example https://inspector.example:6274."
+        }
+      }
+    },
+    "proxy": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Settings for the `mcp-auth-proxy` authentication gateway.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether mcp-auth-proxy is enabled. By default (omitted), the proxy starts if password or OAuth authentication is configured in auth. Set to false to disable the auth proxy, or true to require it."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 8080,
+          "description": "Port the auth proxy listens on. 0 is not supported: the tunnel target and status need the real port."
+        },
+        "path": {
+          "type": "string",
+          "description": "Where mcp-auth-proxy lives, if it is not on PATH or in ~/.local/bin."
+        },
+        "external_url": {
+          "type": "string",
+          "description": "Public URL clients use to reach the auth proxy, for example https://device.example.ts.net. Required once authentication is enabled."
         }
       }
     },
@@ -281,14 +306,25 @@
             }
           ]
         },
+        "autostart": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether `mcp-ctl up` (without arguments) starts this server on daemon startup."
+        },
         "serve": {
           "type": "boolean",
           "default": false,
-          "description": "Whether `mcp-ctl up` serves this server."
+          "description": "Deprecated synonym for `autostart`. Whether `mcp-ctl up` serves this server."
         },
         "enabled": {
           "type": "boolean",
           "default": true
+        },
+        "restart": {
+          "type": "string",
+          "enum": ["never", "on-failure"],
+          "default": "never",
+          "description": "Restart this server when it exits unexpectedly. `on-failure` retries with backoff, gives up after five attempts in a row, and needs no service restart. `mcp-ctl server start` always works by hand."
         },
         "prefix": {
           "type": "string",

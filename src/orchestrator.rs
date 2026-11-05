@@ -2,6 +2,7 @@
 //! supervise them until the operator or `mcp-ctl stop` asks for a shutdown.
 
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -12,18 +13,28 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::{
-    AuthConfig, Paths, ServerConfig, ToolConfig, TunnelProvider, mcp_endpoint_url,
+    AuthConfig, Paths, ProxyConfig, ServerConfig, ToolConfig, TunnelProvider, mcp_endpoint_url,
 };
 use crate::control::{self, ControlInfo, ControlServer, StateFile};
 use crate::exposure;
 use crate::http::{HttpOptions, HttpServer};
-use crate::hub::{BackendSpec, BackendTimeouts, Hub};
-use crate::servers::{self, McpServer};
+use crate::hub::{BackendSpec, BackendTimeouts, Hub, RemoteSpec};
+use crate::servers::{self, McpServer, RestartPolicy};
 use crate::tray::{self, TrayAction, TrayInfo};
 use crate::{daemon, platform, secret};
 
 /// How often the supervisor checks whether a backend has died.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How many automatic restarts a server gets before the supervisor gives up and says
+/// so, so a server that fails on every start cannot loop forever.
+const MAX_RESTARTS: u32 = 5;
+
+/// The first automatic restart waits this long; each further one doubles it.
+const RESTART_BACKOFF_BASE: Duration = Duration::from_secs(1);
+
+/// How long a restarted server must stay up before its restart budget is reset.
+const RESTART_STABLE_AFTER: Duration = Duration::from_secs(60);
 
 /// A supervised child process (auth proxy or tunnel).
 struct ChildProc {
@@ -103,6 +114,65 @@ impl UpOptions {
     }
 }
 
+/// Start one server from the profile and publish its tools.
+///
+/// Used both for the set `up` connects at boot and for `mcp-ctl server start` on a
+/// running daemon, so a server started later resolves its secrets, timeouts and tool
+/// filters exactly like one started at boot.
+///
+/// One server's secret may be unavailable (a locked vault, a missing CLI, a lookup that
+/// times out). The caller decides whether that skips one server or fails the command.
+pub fn start_backend(
+    hub: &Hub,
+    paths: &Paths,
+    server_config: &ServerConfig,
+    name: &str,
+    server: &McpServer,
+) -> Result<usize> {
+    let timeouts = BackendTimeouts {
+        handshake: BackendTimeouts::DEFAULT_HANDSHAKE,
+        tool: server.tool_timeout(server_config.tool_timeout()),
+    };
+
+    // A remote server is connected over HTTP; a local one is spawned. The rest
+    // (filters, prefixes, failure handling) is identical.
+    if server.is_remote() {
+        let url = server
+            .url
+            .as_deref()
+            .with_context(|| format!("'{name}' has no url"))?;
+        let headers =
+            servers::resolve_headers_with_timeout(name, server, server_config.secret_timeout())?;
+        let oauth = oauth_client(paths, name, server)?;
+        return hub.add_remote(RemoteSpec {
+            name,
+            url,
+            headers,
+            oauth,
+            prefix: server.prefix.as_deref(),
+            filter: server.tools.as_ref(),
+            timeouts,
+        });
+    }
+
+    let command = server
+        .command
+        .as_deref()
+        .with_context(|| format!("'{name}' has neither a command nor a url"))?;
+    let env = servers::resolve_env_with_timeout(name, server, server_config.secret_timeout())?;
+    hub.add_server(BackendSpec {
+        name,
+        command,
+        args: &server.args,
+        cwd: server.cwd.as_deref(),
+        env: &env,
+        env_clear: server.env_clear,
+        prefix: server.prefix.as_deref(),
+        filter: server.tools.as_ref(),
+        timeouts,
+    })
+}
+
 /// Start everything and block until shutdown.
 pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result<()> {
     daemon::ensure_not_running(paths)?;
@@ -111,6 +181,7 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
         servers::select(&tool_config.mcp_servers, &options.names, options.all)?;
 
     let server_config = tool_config.server();
+    let proxy_config = tool_config.proxy();
     let auth_config = tool_config.auth();
     let tunnel_config = tool_config.tunnel();
 
@@ -229,6 +300,12 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
     });
     let control_hub = Arc::clone(&hub);
     let control_stop = stop_tx.clone();
+    // The profile on disk is re-read by `mcp-ctl server start`, so what the daemon was
+    // launched with is settled here: ports, timeouts and auth stay as `up` decided them.
+    let control_context = Arc::new(control::BackendContext {
+        paths: paths.clone(),
+        server: server_config.clone(),
+    });
     let control_panic_stop = stop_tx.clone();
     let control_running = Arc::clone(&running);
     let control_failed = Arc::clone(&component_failed);
@@ -236,7 +313,7 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
         .name("control".to_string())
         .spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                control.serve(control_info, control_hub, control_stop);
+                control.serve(control_info, control_hub, control_stop, control_context);
             }));
             // A panic here makes the daemon unmanageable (`status`/`stop` stop
             // answering), so treat it like a failed component instead of leaving a
@@ -261,84 +338,10 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
     }
 
     // --- Backends -----------------------------------------------------------
-    let tool_timeout = server_config.tool_timeout();
     outln!("\nConnecting to backends...");
     let mut failed = Vec::new();
     for (name, server) in &selected {
-        let timeouts = BackendTimeouts {
-            handshake: BackendTimeouts::DEFAULT_HANDSHAKE,
-            tool: server.tool_timeout(tool_timeout),
-        };
-
-        // A remote server is connected over HTTP; a local one is spawned. The rest
-        // (filters, prefixes, failure handling) is identical.
-        if server.is_remote() {
-            let Some(url) = server.url.as_deref() else {
-                continue;
-            };
-            let headers = match servers::resolve_headers_with_timeout(
-                name,
-                server,
-                server_config.secret_timeout(),
-            ) {
-                Ok(headers) => headers,
-                Err(error) => {
-                    errln!("warning: skipping '{name}': {error:#}");
-                    failed.push(name.as_str());
-                    continue;
-                }
-            };
-            let oauth = match oauth_client(paths, name, server) {
-                Ok(client) => client,
-                Err(error) => {
-                    errln!("warning: skipping '{name}': {error:#}");
-                    failed.push(name.as_str());
-                    continue;
-                }
-            };
-            let spec = crate::hub::RemoteSpec {
-                name,
-                url,
-                headers,
-                oauth,
-                prefix: server.prefix.as_deref(),
-                filter: server.tools.as_ref(),
-                timeouts,
-            };
-            if let Err(error) = hub.add_remote(spec) {
-                errln!("warning: skipping '{name}': {error:#}");
-                failed.push(name.as_str());
-            }
-            continue;
-        }
-
-        let Some(command) = &server.command else {
-            continue;
-        };
-        // One server's secret may be unavailable (a locked vault, a missing CLI, a
-        // timed-out command). That is a reason to skip that server, not to refuse to
-        // serve the others.
-        let env =
-            match servers::resolve_env_with_timeout(name, server, server_config.secret_timeout()) {
-                Ok(env) => env,
-                Err(error) => {
-                    errln!("warning: skipping '{name}': {error:#}");
-                    failed.push(name.as_str());
-                    continue;
-                }
-            };
-        let spec = BackendSpec {
-            name,
-            command,
-            args: &server.args,
-            cwd: server.cwd.as_deref(),
-            env: &env,
-            env_clear: server.env_clear,
-            prefix: server.prefix.as_deref(),
-            filter: server.tools.as_ref(),
-            timeouts,
-        };
-        if let Err(error) = hub.add_server(spec) {
+        if let Err(error) = start_backend(&hub, paths, &server_config, name, server) {
             errln!("warning: skipping '{name}': {error:#}");
             failed.push(name.as_str());
         }
@@ -404,6 +407,7 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
         let proxy = start_auth_proxy(
             &auth_config,
             &server_config,
+            &proxy_config,
             external_url.as_deref(),
             proxy_port,
             hub_port,
@@ -502,6 +506,7 @@ pub fn up(paths: &Paths, tool_config: &ToolConfig, options: UpOptions) -> Result
         paths: paths.clone(),
         state,
         children,
+        restarts: BTreeMap::new(),
     };
 
     // On macOS and Windows the tray icon belongs to the thread that runs the application
@@ -571,6 +576,18 @@ struct Supervisor {
     paths: Paths,
     state: StateFile,
     children: Vec<ChildProc>,
+    /// Backends this supervisor is bringing back after an unexpected exit.
+    restarts: BTreeMap<String, RestartState>,
+}
+
+/// One backend on its way back: when the next attempt is due, and how many automatic
+/// restarts it has already spent.
+struct RestartState {
+    due: Instant,
+    attempts: u32,
+    /// Set once an automatic restart succeeded; a server that stays up long enough gets
+    /// its attempts cleared, so a rare crash never exhausts the budget.
+    started: Option<Instant>,
 }
 
 impl Supervisor {
@@ -625,9 +642,14 @@ impl Supervisor {
             // Cheap liveness check: one non-blocking wait per backend, so a backend that
             // died loses its tools instead of failing calls one at a time.
             if Instant::now() >= next_health_check {
-                for gone in self.hub.drop_dead() {
-                    errln!("error: backend {gone} exited; its tools are no longer served");
+                for (name, status) in self.hub.drop_dead() {
+                    errln!(
+                        "error: backend '{name}' ({status}) exited; its tools are no longer served"
+                    );
+                    self.schedule_restart(&name);
                 }
+                self.retry_due_restarts();
+                self.clear_recovered_restarts();
                 next_health_check = Instant::now() + HEALTH_INTERVAL;
             }
 
@@ -676,6 +698,145 @@ impl Supervisor {
             Outcome::Stopped
         }
     }
+
+    /// Decide what to do about a backend that just exited on its own.
+    ///
+    /// Off by default: a server that cannot start would otherwise be respawned for as
+    /// long as the daemon runs. The profile is re-read here, so editing the entry while
+    /// the daemon runs changes what happens on the next crash.
+    fn schedule_restart(&mut self, name: &str) {
+        let config = match ToolConfig::load_from(&self.paths.config_file) {
+            Ok(config) => config,
+            Err(error) => {
+                errln!("warning: cannot re-read the profile for '{name}': {error:#}");
+                return;
+            }
+        };
+        let Some(server) = config.mcp_servers.get(name) else {
+            return;
+        };
+        if server.restart != RestartPolicy::OnFailure {
+            return;
+        }
+        let attempts = self.restarts.get(name).map_or(0, |state| state.attempts);
+        if attempts >= MAX_RESTARTS {
+            errln!(
+                "error: '{name}' failed {attempts} times in a row; giving up. Start it by hand \
+                 with `mcp-ctl server start {name}` once the cause is fixed."
+            );
+            return;
+        }
+        let delay = restart_delay(attempts);
+        self.restarts.insert(
+            name.to_string(),
+            RestartState {
+                due: Instant::now() + delay,
+                attempts: attempts + 1,
+                started: None,
+            },
+        );
+        outln!(
+            "Restarting '{name}' in {}s (attempt {}/{MAX_RESTARTS}); `mcp-ctl server stop {name}` cancels it.",
+            delay.as_secs(),
+            attempts + 1
+        );
+    }
+
+    /// Start the backends whose backoff has elapsed.
+    fn retry_due_restarts(&mut self) {
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .restarts
+            .iter()
+            .filter(|(_, state)| state.started.is_none() && state.due <= now)
+            .map(|(name, _)| name.clone())
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        // Re-read the profile, so a fix made while the service was running is picked up
+        // by the next attempt instead of needing a full restart.
+        let config = match ToolConfig::load_from(&self.paths.config_file) {
+            Ok(config) => config,
+            Err(error) => {
+                errln!("warning: cannot re-read the profile to restart servers: {error:#}");
+                self.restarts.clear();
+                return;
+            }
+        };
+        let server_config = config.server();
+
+        for name in due {
+            // Someone may have started it by hand while the backoff was running.
+            if self.hub.is_running(&name) {
+                self.restarts.remove(&name);
+                continue;
+            }
+            let Some(server) = config.mcp_servers.get(&name) else {
+                self.restarts.remove(&name);
+                continue;
+            };
+            match start_backend(&self.hub, &self.paths, &server_config, &name, server) {
+                Ok(published) => {
+                    outln!("Restarted '{name}' ({published} tool(s)).");
+                    if let Some(state) = self.restarts.get_mut(&name) {
+                        state.started = Some(Instant::now());
+                    }
+                }
+                Err(error) => {
+                    let Some(state) = self.restarts.get_mut(&name) else {
+                        continue;
+                    };
+                    if state.attempts >= MAX_RESTARTS {
+                        errln!(
+                            "error: '{name}' failed {MAX_RESTARTS} restarts in a row; giving up. \
+                             Start it by hand with `mcp-ctl server start {name}`."
+                        );
+                        self.restarts.remove(&name);
+                        continue;
+                    }
+                    state.attempts += 1;
+                    let delay = restart_delay(state.attempts);
+                    state.due = Instant::now() + delay;
+                    errln!(
+                        "warning: could not restart '{name}': {error:#}; retrying in {}s (attempt {}/{MAX_RESTARTS})",
+                        delay.as_secs(),
+                        state.attempts
+                    );
+                }
+            }
+        }
+    }
+
+    /// Give a backend that has stayed up its restart budget back, so a crash months
+    /// later starts from the first, shortest backoff again.
+    fn clear_recovered_restarts(&mut self) {
+        let now = Instant::now();
+        let recovered: Vec<String> = self
+            .restarts
+            .iter()
+            .filter(|(name, state)| {
+                state
+                    .started
+                    .is_some_and(|started| now.duration_since(started) >= RESTART_STABLE_AFTER)
+                    && self.hub.is_running(name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in recovered {
+            self.restarts.remove(&name);
+            outln!(
+                "'{name}' has stayed up for {}s; its automatic restart budget is back to zero.",
+                RESTART_STABLE_AFTER.as_secs()
+            );
+        }
+    }
+}
+
+/// 1s, 2s, 4s, ... capped so a crash loop stays visible without flooding the log.
+fn restart_delay(attempts: u32) -> Duration {
+    let factor = 1u32 << attempts.min(5);
+    (RESTART_BACKOFF_BASE * factor).min(Duration::from_secs(60))
 }
 
 /// Start `mcp-auth-proxy` in front of the hub.
@@ -686,12 +847,13 @@ impl Supervisor {
 fn start_auth_proxy(
     auth: &AuthConfig,
     server_config: &ServerConfig,
+    proxy_config: &ProxyConfig,
     external_url: Option<&str>,
     proxy_port: u16,
     hub_port: u16,
     paths: &Paths,
 ) -> Result<Child> {
-    let binary = exposure::find_auth_proxy(server_config)?;
+    let binary = exposure::find_auth_proxy(proxy_config, server_config)?;
     let external_url = external_url.context("authentication requires a public URL")?;
 
     // The proxy keeps its private key and secret in here: owner-only on Unix.

@@ -424,8 +424,13 @@ pub fn status_all(json: bool) -> Result<()> {
 
 /// How many servers a profile has configured, when its file can be read.
 fn configured_servers(paths: &Paths) -> Option<usize> {
+    configured_names(paths).map(|names| names.len())
+}
+
+/// The server names the profile file holds, whatever their state.
+fn configured_names(paths: &Paths) -> Option<Vec<String>> {
     let tool_config = ToolConfig::load_from(&paths.config_file).ok()?;
-    Some(tool_config.mcp_servers.len())
+    Some(tool_config.mcp_servers.keys().cloned().collect())
 }
 
 /// Report what the daemon is doing, or that nothing is running.
@@ -531,6 +536,8 @@ fn print_status(paths: &Paths, report: &StatusReport) {
             .map(|server| {
                 if server.alive {
                     format!("{} ({} tools)", server.name, server.tools)
+                } else if server.stopped {
+                    format!("{} (stopped)", server.name)
                 } else {
                     format!("{} (exited)", server.name)
                 }
@@ -542,6 +549,24 @@ fn print_status(paths: &Paths, report: &StatusReport) {
             report.total_tools,
             report.calls
         );
+    }
+    // Configured, but not running: a `serve: false` entry waiting to be started, or one
+    // stopped on purpose. This is the on-demand workflow's list.
+    if let Some(configured) = configured_names(paths) {
+        let known: std::collections::BTreeSet<&str> = report
+            .servers
+            .iter()
+            .map(|server| server.name.as_str())
+            .collect();
+        let idle = configured
+            .iter()
+            .filter(|name| !known.contains(name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !idle.is_empty() {
+            outln!("  Idle:     {idle} — start one with `mcp-ctl server start <name>`");
+        }
     }
     outln!("  Log:      {}", report.log_file.display());
 

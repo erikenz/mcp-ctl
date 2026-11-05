@@ -83,6 +83,11 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Start, stop, or restart one server while the rest of the hub keeps serving
+    Server {
+        #[command(subcommand)]
+        action: ServerAction,
+    },
     /// Restart the background hub (starts it when it is not running)
     Restart(ServeArgs),
     /// Check the configuration and resolve secrets without starting anything
@@ -112,6 +117,33 @@ enum Commands {
         /// Machine-readable output, for scripts and menu-bar wrappers
         #[arg(long)]
         json: bool,
+    },
+}
+
+/// What `mcp-ctl server` can do.
+///
+/// These act on one daemon that is already running. `restart` without `server` still
+/// restarts the whole service; this is the per-backend one, which leaves every other
+/// server (and its client connections) alone.
+#[derive(Subcommand)]
+enum ServerAction {
+    /// Start a configured server in the running hub
+    Start {
+        /// Server name(s) from the profile file
+        #[arg(required = true, value_name = "NAME")]
+        names: Vec<String>,
+    },
+    /// Stop a server and withdraw its tools; every other server keeps serving
+    Stop {
+        /// Server name(s) from the profile file
+        #[arg(required = true, value_name = "NAME")]
+        names: Vec<String>,
+    },
+    /// Stop a server and start it again, which is what a crashed one needs
+    Restart {
+        /// Server name(s) from the profile file
+        #[arg(required = true, value_name = "NAME")]
+        names: Vec<String>,
     },
 }
 
@@ -151,10 +183,10 @@ enum AuthAction {
 /// Flags shared by `up` and `restart`.
 #[derive(Args)]
 struct ServeArgs {
-    /// Server name(s) to serve. Defaults to every server with "serve": true.
+    /// Server name(s) to serve. Defaults to every server with "autostart": true.
     names: Vec<String>,
 
-    /// Serve every enabled server, ignoring the "serve": true filter
+    /// Serve every enabled server, ignoring the "autostart": true filter
     #[arg(long, short)]
     all: bool,
 
@@ -293,6 +325,24 @@ fn run() -> Result<u8> {
             orchestrator::up(&paths, &tool_config, options)?;
         }
         Commands::Stop { force } => daemon::stop(&paths, force)?,
+        Commands::Server { action } => {
+            let (command, names) = match action {
+                ServerAction::Start { names } => ("start", names),
+                ServerAction::Stop { names } => ("stop", names),
+                ServerAction::Restart { names } => ("restart", names),
+            };
+            let Some(state) = daemon::running_state(&paths)? else {
+                anyhow::bail!(
+                    "no mcp-ctl service is running for this profile; start one with `mcp-ctl up -d`"
+                );
+            };
+            // One line per server, so a partly successful command still says which
+            // half worked.
+            let message = control::request_backends(&state, command, &names)?;
+            if !message.is_empty() {
+                outln!("{message}");
+            }
+        }
         Commands::Restart(serve) => {
             let options = serve.into_options(cli.verbose, cli.verbose_bodies, &paths)?;
             if std::io::stdin().is_terminal() {
@@ -411,8 +461,8 @@ fn list(paths: &Paths, tool_config: &ToolConfig) -> Result<()> {
 
     for (name, server) in &tool_config.mcp_servers {
         let mut flags: Vec<String> = Vec::new();
-        if server.serve {
-            flags.push("serve".to_string());
+        if server.autostart() {
+            flags.push("autostart".to_string());
         }
         if !server.enabled {
             flags.push("disabled".to_string());

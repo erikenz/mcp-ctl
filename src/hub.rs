@@ -670,6 +670,9 @@ pub struct ServerStatus {
     pub tool_count: usize,
     /// False when the child process has exited.
     pub running: bool,
+    /// True when it was stopped on purpose rather than crashing, so a report can tell
+    /// "waiting for you to start it" from "something went wrong".
+    pub stopped: bool,
 }
 
 /// The hub: every served backend, and the tool names they are published under.
@@ -737,6 +740,21 @@ impl Registry {
         }
         (published, renamed)
     }
+
+    /// Take back everything a set of backends published.
+    ///
+    /// Routes and definitions go together: a definition whose route is gone would be
+    /// listed but unanswerable, and a route without a definition would be invisible.
+    fn withdraw(&mut self, names: &BTreeSet<String>) {
+        self.routes
+            .retain(|_, route| !names.contains(route.server.as_str()));
+        let published: BTreeSet<String> = self.routes.keys().cloned().collect();
+        self.tools.retain(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| published.contains(name))
+        });
+    }
 }
 
 /// A served backend: the process, plus how many tools it contributed and whether it is
@@ -745,6 +763,8 @@ struct Backend {
     server: Arc<Mutex<Served>>,
     tools: usize,
     alive: bool,
+    /// Stopped on request, as opposed to having exited on its own.
+    stopped: bool,
     /// The backend's process id, so it can be stopped even if the lock is busy. Zero
     /// for a remote server, which has no process to signal.
     pid: u32,
@@ -834,7 +854,7 @@ impl Hub {
 
     /// Start a backend server and publish the tools that survive its filter.
     pub fn add_server(&self, spec: BackendSpec<'_>) -> Result<usize> {
-        let server = ChildServer::spawn(
+        let mut server = ChildServer::spawn(
             spec.name,
             spec.command,
             spec.args,
@@ -850,6 +870,17 @@ impl Hub {
         // and the backend itself can never disagree.
         let (published, renamed) = {
             let mut registry = write_lock(&self.registry);
+            // Two `server start` requests for the same name can race here. The loser
+            // must not leave a second process running that nobody can reach.
+            if registry
+                .backends
+                .get(spec.name)
+                .is_some_and(|backend| backend.alive)
+            {
+                drop(registry);
+                let _ = server.shutdown(platform::GRACEFUL_EXIT);
+                bail!("'{}' is already running", spec.name);
+            }
             let (published, renamed) =
                 registry.publish(spec.name, spec.prefix, spec.filter, &server.tools);
             registry.backends.insert(
@@ -858,6 +889,7 @@ impl Hub {
                     server: Arc::new(Mutex::new(Served::Stdio(server))),
                     tools: published,
                     alive: true,
+                    stopped: false,
                     pid,
                 },
             );
@@ -870,13 +902,22 @@ impl Hub {
 
     /// Connect a remote server and publish the tools that survive its filter.
     pub fn add_remote(&self, spec: RemoteSpec<'_>) -> Result<usize> {
-        let server =
+        let mut server =
             RemoteServer::connect(spec.name, spec.url, spec.headers, spec.oauth, spec.timeouts)?;
         let available = server.tools().len();
         let definitions = server.tools().to_vec();
 
         let (published, renamed) = {
             let mut registry = write_lock(&self.registry);
+            if registry
+                .backends
+                .get(spec.name)
+                .is_some_and(|backend| backend.alive)
+            {
+                drop(registry);
+                let _ = server.shutdown(platform::GRACEFUL_EXIT);
+                bail!("'{}' is already running", spec.name);
+            }
             let (published, renamed) =
                 registry.publish(spec.name, spec.prefix, spec.filter, &definitions);
             registry.backends.insert(
@@ -885,6 +926,7 @@ impl Hub {
                     server: Arc::new(Mutex::new(Served::Remote(Box::new(server)))),
                     tools: published,
                     alive: true,
+                    stopped: false,
                     // No process to signal; shutdown goes through the session instead.
                     pid: 0,
                 },
@@ -1109,7 +1151,7 @@ impl Hub {
     ///
     /// Returns one line per newly dead backend so the caller can report it. Cheap:
     /// one non-blocking `waitpid` per backend, no backend locks held across the work.
-    pub fn drop_dead(&self) -> Vec<String> {
+    pub fn drop_dead(&self) -> Vec<(String, String)> {
         let mut gone = Vec::new();
         {
             let mut registry = write_lock(&self.registry);
@@ -1126,7 +1168,7 @@ impl Hub {
                     .and_then(|mut server| server.exited_status());
                 if let Some(status) = exited {
                     backend.alive = false;
-                    gone.push(format!("'{name}' ({status})"));
+                    gone.push((name.clone(), status));
                 }
             }
             if gone.is_empty() {
@@ -1141,17 +1183,71 @@ impl Hub {
                 .filter(|(_, backend)| !backend.alive)
                 .map(|(name, _)| name.clone())
                 .collect();
-            registry
-                .routes
-                .retain(|_, route| !dead.contains(route.server.as_str()));
-            let published: BTreeSet<String> = registry.routes.keys().cloned().collect();
-            registry.tools.retain(|tool| {
-                tool.get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| published.contains(name))
-            });
+            registry.withdraw(&dead);
         }
         gone
+    }
+
+    /// Stop one backend and withdraw its tools, leaving every other server serving.
+    ///
+    /// Returns `true` when it was running. Stopping something already stopped is not an
+    /// error: `restart` is defined as stop-then-start, and a crashed backend is already
+    /// gone. The entry stays in the registry as `running: false` so `status` can still
+    /// name it.
+    pub fn stop_backend(&self, name: &str) -> Result<bool> {
+        let (server, pid) = {
+            let mut registry = write_lock(&self.registry);
+            let Some(backend) = registry.backends.get_mut(name) else {
+                bail!("'{name}' is not served by this hub");
+            };
+            if !backend.alive {
+                return Ok(false);
+            }
+            let server = Arc::clone(&backend.server);
+            let pid = backend.pid;
+            backend.alive = false;
+            backend.stopped = true;
+            // Nothing may point at the backend before it is stopped, or a call could
+            // arrive for a process that is on its way out.
+            registry.withdraw(&BTreeSet::from([name.to_string()]));
+            (server, pid)
+        };
+
+        // Outside the registry lock: a graceful stop can take seconds, and that lock is
+        // the whole hub. A tool call already in flight holds the backend's own lock, so
+        // fall back to the process group exactly like a full shutdown does.
+        match server.try_lock() {
+            Ok(mut served) => {
+                if let Err(error) = served.shutdown(platform::GRACEFUL_EXIT) {
+                    errln!("warning: failed to stop '{name}': {error}");
+                }
+            }
+            Err(_) => {
+                errln!("warning: '{name}' is still busy; terminating its process group");
+                if pid != 0
+                    && let Err(error) = platform::terminate_group(pid)
+                {
+                    errln!("warning: failed to stop '{name}': {error}");
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Is this server running right now?
+    pub fn is_running(&self, name: &str) -> bool {
+        read_lock(&self.registry)
+            .backends
+            .get(name)
+            .is_some_and(|backend| backend.alive)
+    }
+
+    /// Has this hub ever been given this server, running or not?
+    ///
+    /// Lets `stop` tell a typo ("unknown server") from a staged server that was simply
+    /// never started ("was not running").
+    pub fn knows(&self, name: &str) -> bool {
+        read_lock(&self.registry).backends.contains_key(name)
     }
 
     /// Every backend, its tool count and whether it is still running.
@@ -1164,12 +1260,14 @@ impl Hub {
     }
 
     pub fn statuses(&self) -> Vec<ServerStatus> {
-        self.summarize()
-            .into_iter()
-            .map(|(name, tool_count, running)| ServerStatus {
-                name,
-                tool_count,
-                running,
+        read_lock(&self.registry)
+            .backends
+            .iter()
+            .map(|(name, backend)| ServerStatus {
+                name: name.clone(),
+                tool_count: backend.tools,
+                running: backend.alive,
+                stopped: backend.stopped,
             })
             .collect()
     }
@@ -1366,5 +1464,40 @@ mod tests {
             .expect("a request must be answered");
         assert_eq!(response["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(response["result"]["serverInfo"]["name"], "mcp-ctl");
+    }
+
+    #[test]
+    fn withdrawing_one_backend_leaves_the_others_published() {
+        let mut registry = Registry::default();
+        let definitions = vec![json!({ "name": "echo" }), json!({ "name": "slow" })];
+        registry.publish("alpha", None, None, &definitions);
+        registry.publish("beta", None, None, &definitions);
+        // Collisions are qualified with the server name, so nothing was dropped.
+        assert_eq!(registry.routes.len(), 4);
+        assert!(registry.routes.contains_key("beta_echo"));
+
+        registry.withdraw(&BTreeSet::from(["alpha".to_string()]));
+
+        // Alpha's route *and* its definition are gone: a listed tool with no route
+        // would be unanswerable, and a route with no definition invisible.
+        assert_eq!(registry.routes.len(), 2);
+        assert!(!registry.routes.contains_key("echo"));
+        assert!(registry.routes.contains_key("beta_echo"));
+        assert_eq!(registry.tools.len(), 2);
+        let listed: Vec<&str> = registry
+            .tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(listed, vec!["beta_echo", "beta_slow"]);
+    }
+
+    #[test]
+    fn a_stopped_server_is_known_but_not_running() {
+        let hub = Hub::new();
+        assert!(!hub.is_running("alpha"));
+        assert!(!hub.knows("alpha"));
+        // Stopping something this hub never had is reported rather than ignored.
+        assert!(hub.stop_backend("alpha").is_err());
     }
 }

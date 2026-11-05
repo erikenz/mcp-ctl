@@ -1142,7 +1142,12 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf);
                 let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                let _ = stream.read(&mut buf);
             }
         });
         assert!(is_serving(localhost, port));
